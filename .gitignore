@@ -2,3 +2,5 @@
 /config.json
 /data/
 /.idea/
+/dist/
+/node_modules/
