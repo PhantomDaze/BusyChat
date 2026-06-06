@@ -128,7 +128,7 @@ function createMockModels(): ModelAdminGateway {
 
   return {
     async embed(inputs: string[]): Promise<EmbeddingResponse> {
-      return { vectors: deterministicEmbed(inputs, dimension) };
+      return {vectors: deterministicEmbed(inputs, dimension)};
     },
 
     async rerank(query: string, candidates: string[]): Promise<RerankResponse> {
@@ -138,12 +138,12 @@ function createMockModels(): ModelAdminGateway {
         const textWords = text.toLowerCase().split(/\s+/).filter(Boolean);
         const overlap = textWords.filter((w) => queryWords.has(w)).length;
         const score = textWords.length > 0
-          ? overlap / Math.max(textWords.length, 1)
-          : 0;
-        return { index, score };
+            ? overlap / Math.max(textWords.length, 1)
+            : 0;
+        return {index, score};
       });
       ranking.sort((a, b) => b.score - a.score);
-      return { ranking };
+      return {ranking};
     },
 
     async generateText(task: string, input: string): Promise<TextModelResponse> {
@@ -152,20 +152,32 @@ function createMockModels(): ModelAdminGateway {
       };
     },
 
-    async transcribe(): Promise<{ text: string }> {
-      return { text: 'mock transcription' };
+    async transcribe(): Promise<{ text: string; }> {
+      return {text: 'mock transcription'};
     },
 
     // Admin methods (not needed for service tests)
-    listFamilies() { return ['language', 'embedding', 'rerank'] as const; },
-    listTasks() { return ['summary', 'memory-summary', 'embedding', 'rerank'] as const; },
-    async listModels() { return []; },
-    async listModelsByFamily() { return []; },
-    async upsertModel() {},
-    async setModelEnabled() {},
-    async setActiveModel() {},
-    async removeModel() {},
-  } as ModelAdminGateway;
+    listFamilies() {
+      return ['language', 'embedding', 'rerank'] as const;
+    },
+    listTasks() {
+      return ['summary', 'memory-summary', 'embedding', 'rerank'] as const;
+    },
+    async listModels() {
+      return [];
+    },
+    async listModelsByFamily() {
+      return [];
+    },
+    async upsertModel() {
+    },
+    async setModelEnabled() {
+    },
+    async setActiveModel() {
+    },
+    async removeModel() {
+    },
+  } as unknown as ModelAdminGateway;
 }
 
 function createMockLogger(name: string): Logger {
