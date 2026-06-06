@@ -1,0 +1,192 @@
+{
+  "_comment": "=== F261Agent 配置文件模板 === 复制为 config.json 后修改。JSON 不支持注释，请忽略 _comment 和 _* 字段。",
+
+  "settings": {
+    "_comment": "进程级启动参数，修改后需重启应用。",
+
+    "dataDir": "data",
+    "_dataDir": "数据存储目录。默认 data/，含 f261agent.db（SQLite 数据库）。",
+
+    "host": "127.0.0.1",
+    "_host": "WebUI 和 OneBot 事件接收的监听地址。0.0.0.0 允许外部访问。",
+
+    "port": 3000,
+    "_port": "监听端口。",
+
+    "pluginSearchDirs": ["dist/plugins", "src/plugins"],
+    "_pluginSearchDirs": "插件搜索目录，按优先级排列。开发时 src/plugins 优先，生产用 dist/plugins。",
+
+    "uiPath": "/ui",
+    "_uiPath": "WebUI 仪表盘的访问路径。",
+
+    "eventPath": "/onebot/event",
+    "_eventPath": "OneBot HTTP 事件上报的接收路径。"
+  },
+
+  "runtime": {
+    "_comment": "运行时配置，可通过 WebUI 热修改，无需重启。",
+
+    "admins": ["10001", "10002"],
+    "_admins": "管理员 QQ 号列表。管理员可使用所有命令，也是摘要报告的唯一接收者。",
+
+    "notifyKeywords": [],
+    "_notifyKeywords": "关键词告警列表。消息含关键词时立即私聊通知管理员（免打扰时段除外）。例如 [\"紧急\", \"报警\"]。",
+
+    "quietHours": null,
+    "_quietHours": "免打扰时段（可选）。格式: { \"start\": \"23:00\", \"end\": \"07:00\" }。时段内普通消息不推送给管理员，关键词告警仍然生效。不设置则 24 小时通知。",
+
+    "onebot": {
+      "_comment": "OneBot v11 协议连接配置。",
+
+      "baseUrl": "http://127.0.0.1:5700",
+      "_baseUrl": "OneBot 实现的 HTTP API 地址。",
+
+      "apiPrefix": "/api",
+      "_apiPrefix": "API 路径前缀，通常为 /api。",
+
+      "accessToken": "",
+      "_accessToken": "OneBot access_token（可选）。如果 OneBot 实现配置了 token，请填写。",
+
+      "selfId": "",
+      "_selfId": "机器人自身的 QQ 号（可选）。不填则从上报事件中自动获取。",
+
+      "timeoutMs": 10000,
+      "_timeoutMs": "HTTP API 请求超时（毫秒）。",
+
+      "webSocket": {
+        "_comment": "WebSocket 连接模式。正向 = 应用连协议，反向 = 协议连应用。",
+
+        "mode": "off",
+        "_mode": "off | forward | reverse | both。推荐 forward（应用主动连接协议端）。",
+
+        "forwardUrl": "ws://127.0.0.1:6700",
+        "_forwardUrl": "正向模式：OneBot 实现暴露的 WebSocket 地址。",
+
+        "reversePath": "/onebot/ws",
+        "_reversePath": "反向模式：F261Agent 暴露的 WebSocket 路径。",
+
+        "reconnectIntervalMs": 5000,
+        "_reconnectIntervalMs": "正向模式断线后重连间隔（毫秒）。",
+
+        "actionTimeoutMs": 10000,
+        "_actionTimeoutMs": "WebSocket API 调用的超时（毫秒）。"
+      }
+    },
+
+    "summary": {
+      "_comment": "消息摘要定时任务配置。",
+
+      "enabled": true,
+      "_enabled": "是否启用定时消息摘要。",
+
+      "intervalMs": 120000,
+      "_intervalMs": "摘要生成间隔（毫秒），默认 120000 = 2 分钟。",
+
+      "batchSize": 5,
+      "_batchSize": "触发自动摘要所需的最小新消息数。手动触发不受此限制。",
+
+      "maxEventsPerPrompt": 40,
+      "_maxEventsPerPrompt": "每次 LLM 调用包含的最多事件数，超出部分截断。"
+    },
+
+    "knowledgeBase": {
+      "_comment": "长期记忆知识库配置。使用嵌入模型和重排序模型进行语义搜索。",
+
+      "enabled": true,
+      "_enabled": "是否启用知识库。",
+
+      "maxResults": 10,
+      "_maxResults": "搜索返回的最大结果数。",
+
+      "vectorDimension": 768,
+      "_vectorDimension": "向量维度。rule-based fallback 为 8；OpenAI 兼容嵌入模型通常为 768 或 1024。"
+    },
+
+    "activeModels": {
+      "_comment": "每个任务绑定到哪个模型。未配置的任务自动选用第一个可用模型。",
+
+      "summary": "language-fallback",
+      "advice": "language-fallback",
+      "chat": "language-fallback",
+      "classifier": "language-fallback",
+      "moderation": "language-fallback",
+      "memory-summary": "language-fallback",
+      "transcription": "stt-fallback",
+      "embedding": "embedding-fallback",
+      "rerank": "rerank-fallback"
+    },
+
+    "models": {
+      "_comment": "模型注册表，按 family 分组。每个模型需声明 provider、enabled、taskBindings 和 parameters。",
+
+      "language": [
+        {
+          "_comment": "内置 fallback 语言模型。配置真实模型后建议保持 enabled 以防 API 故障时自动降级。",
+          "id": "language-fallback",
+          "label": "Language Fallback",
+          "family": "language",
+          "provider": "rule-based",
+          "enabled": true,
+          "taskBindings": ["summary", "advice", "chat", "classifier", "moderation", "memory-summary"],
+          "parameters": { "note": "Deterministic fallback language model." }
+        }
+      ],
+
+      "speech-to-text": [
+        {
+          "id": "stt-fallback",
+          "label": "Speech To Text Fallback",
+          "family": "speech-to-text",
+          "provider": "rule-based",
+          "enabled": true,
+          "taskBindings": ["transcription"],
+          "parameters": { "note": "Fallback transcription provider." }
+        }
+      ],
+
+      "embedding": [
+        {
+          "id": "embedding-fallback",
+          "label": "Embedding Fallback",
+          "family": "embedding",
+          "provider": "rule-based",
+          "enabled": true,
+          "taskBindings": ["embedding"],
+          "parameters": { "dimension": 8, "note": "Deterministic hash-based embedding fallback." }
+        }
+      ],
+
+      "rerank": [
+        {
+          "id": "rerank-fallback",
+          "label": "Rerank Fallback",
+          "family": "rerank",
+          "provider": "rule-based",
+          "enabled": true,
+          "taskBindings": ["rerank"],
+          "parameters": { "note": "Deterministic keyword-overlap reranker fallback." }
+        }
+      ]
+    },
+
+    "plugins": {
+      "_comment": "插件运行时状态。已加载的插件自动在此生成条目。键名为插件的 manifest.name。"
+    },
+
+    "ui": {
+      "_comment": "WebUI 仪表盘配置。",
+
+      "enabled": true,
+      "_enabled": "是否启用 WebUI。",
+
+      "title": "F261Agent",
+      "_title": "仪表盘页面标题。",
+
+      "password": "",
+      "_password": "WebUI 登录密码（明文存储）。留空则不要求登录。设置后访问 WebUI 需先输入密码。",
+
+      "authToken": "",
+      "_authToken": "WebUI 访问令牌（旧方式，可选）。设置后需在 Header x-admin-token 或 query ?token= 中传入。"
+    }
+  }
+}
