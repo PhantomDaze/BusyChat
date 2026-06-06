@@ -2,7 +2,7 @@
   "name": "f261agent",
   "version": "1.0.0",
   "description": "OneBot v11 AI assistant framework",
-  "license": "ISC",
+  "license": "GPL-3.0",
   "author": "PhantomDaze",
   "type": "commonjs",
   "main": "dist/index.js",
