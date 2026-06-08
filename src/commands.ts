@@ -128,7 +128,7 @@ export class CommandBus {
         handled: true,
         command: commandName,
         args,
-        reply: '该命令仅限管理员使用。',
+        reply: undefined,
       };
     }
 
@@ -208,7 +208,7 @@ export function registerBuiltinCommands(services: AppServices, replies?: ReplyMa
     name: 'help',
     description: '显示所有可用命令',
     usage: '/help',
-    adminOnly: false,
+    adminOnly: true,
     owner: 'builtin',
     execute: async () => formatCommandHelp(bus.list()),
   });
