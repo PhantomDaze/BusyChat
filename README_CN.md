@@ -30,9 +30,20 @@ npm run test:ws
 # 知识库功能测试（14 项）
 npm run test:kb
 
+# 命令权限测试（3 项）
+npm run test:cmd
+
+# 分片/存储持久化/回复路由测试（12 项）
+npm run test:logic
+
+# WebUI 认证/会话/脱敏测试（19 项，启动真实服务器）
+npm run test:webui
+
 # 全部测试
 npm run test:all
 ```
+
+可通过环境变量 `LOG_LEVEL=debug|info|warn|error|silent` 控制日志级别（默认 `info`）。
 
 ## 配置 WebSocket
 
@@ -136,11 +147,12 @@ F261Agent 暴露 `/onebot/ws`，协议端主动连接：
 
 ## 内置命令
 
-所有命令都需提供中文说明。在 QQ 中发送 `/help` 即可查看完整列表。
+所有命令仅在发送者是已配置的管理员（`runtime.admins`）时才会被处理。在 QQ 中发送 `/help` 即可查看完整列表。
 
 | 命令 | 说明 | 权限 |
 |---|---|---|
-| `/help` | 显示所有可用命令 | 任何人 |
+| `/help` | 显示所有可用命令 | 管理员 |
+| `/status` | 查看机器人运行状态（WS/模型/知识库/待回复） | 管理员 |
 | `/summary now` | 立即生成摘要并发送 | 管理员 |
 | `/summary status` | 查看摘要配置状态 | 管理员 |
 | `/report list` | 查看最近摘要记录 | 管理员 |

@@ -14,7 +14,10 @@
     "test": "npm run typecheck",
     "test:ws": "tsx test/onebot-ws.test.ts",
     "test:kb": "tsx test/knowledge.test.ts",
-    "test:all": "npm run typecheck && npm run test:ws && npm run test:kb"
+    "test:cmd": "tsx test/commands.test.ts",
+    "test:logic": "tsx test/logic.test.ts",
+    "test:webui": "tsx test/webui.test.ts",
+    "test:all": "npm run typecheck && npm run test:ws && npm run test:kb && npm run test:cmd && npm run test:logic && npm run test:webui"
   },
   "dependencies": {
     "@hapi/hapi": "^21.4.9",

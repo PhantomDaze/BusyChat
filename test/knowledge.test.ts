@@ -197,16 +197,29 @@ function createMockLogger(name: string): Logger {
 
 const TEST_DATA_DIR = path.resolve(process.cwd(), 'data-test-kb');
 
+let activeStore: FileStore | null = null;
+
 async function createTestFileStore(): Promise<FileStore> {
+  // Flush and close the previous store so its deferred save can't race with the
+  // directory removal below (which would surface as an ENOENT rename warning).
+  if (activeStore) {
+    await activeStore.close();
+    activeStore = null;
+  }
   // Clean up any leftover data first to ensure test isolation
   await cleanupTestData();
   await mkdir(TEST_DATA_DIR, { recursive: true });
   const store = new FileStore(TEST_DATA_DIR);
   await store.ensureReady();
+  activeStore = store;
   return store;
 }
 
 async function cleanupTestData(): Promise<void> {
+  if (activeStore) {
+    await activeStore.close();
+    activeStore = null;
+  }
   try {
     await rm(TEST_DATA_DIR, { recursive: true, force: true });
   } catch {

@@ -307,9 +307,12 @@ function createPluginContext(
       if (!permissions.has('command:register')) {
         throw new Error('plugin lacks command:register permission');
       }
+      // Force the owner to this plugin's name — never trust a caller-supplied
+      // owner, or a plugin could claim `builtin` and hijack a core command
+      // (which would then also survive this plugin's unregisterOwner).
       base.commands.register({
         ...command,
-        owner: command.owner ?? plugin.manifest.name,
+        owner: plugin.manifest.name,
       });
     },
   };
@@ -350,7 +353,10 @@ export class PluginManager implements PluginManagerApi {
 
     for (const filePath of entrypoints) {
       try {
-        const mod = (await dynamicImport(pathToFileURL(filePath).href)) as PluginModule;
+        // Cache-bust the import so `reload()` picks up edited plugin source
+        // instead of returning the previously cached module object.
+        const importUrl = `${pathToFileURL(filePath).href}?v=${Date.now()}`;
+        const mod = (await dynamicImport(importUrl)) as PluginModule;
         const plugin = mod.createPlugin ? unwrapPluginCandidate(await mod.createPlugin()) : resolvePluginModule(mod);
         if (!plugin) {
           this.deps.appLogger.warn('plugin module did not export a plugin', { filePath });
@@ -371,6 +377,22 @@ export class PluginManager implements PluginManagerApi {
         const context = createPluginContext(plugin, this.deps, logger);
         const enabled = pluginState.enabled !== false;
 
+        if (enabled) {
+          // Run setup BEFORE registering the plugin so a setup failure (e.g. a
+          // duplicate command name) doesn't leave a half-initialized plugin in
+          // `loaded` still receiving message hooks. Roll back any commands it
+          // managed to register before throwing.
+          try {
+            await plugin.setup(context);
+          } catch (error) {
+            this.deps.commands.unregisterOwner(plugin.manifest.name);
+            throw error;
+          }
+          logger.info('plugin loaded', { version: plugin.manifest.version, filePath });
+        } else {
+          logger.info('plugin discovered but disabled', { version: plugin.manifest.version, filePath });
+        }
+
         this.loaded.set(plugin.manifest.name, {
           manifest: plugin.manifest,
           plugin,
@@ -378,13 +400,6 @@ export class PluginManager implements PluginManagerApi {
           filePath,
           enabled,
         });
-
-        if (enabled) {
-          await plugin.setup(context);
-          logger.info('plugin loaded', { version: plugin.manifest.version, filePath });
-        } else {
-          logger.info('plugin discovered but disabled', { version: plugin.manifest.version, filePath });
-        }
       } catch (error) {
         this.deps.appLogger.error('failed to load plugin', {
           filePath,
@@ -401,9 +416,19 @@ export class PluginManager implements PluginManagerApi {
   async shutdown(): Promise<void> {
     for (const [name, record] of this.loaded.entries()) {
       this.deps.commands.unregisterOwner(name);
+      // Both teardown() and hooks.onShutdown() are teardown surfaces; a plugin
+      // may use either. Auto-memory clears its daily timer in onShutdown, so
+      // skipping it would leak the interval past disable/reload/app-stop.
+      const teardowns: Array<() => unknown> = [];
+      if (record.plugin.hooks?.onShutdown) {
+        teardowns.push(() => record.plugin.hooks!.onShutdown!(record.context));
+      }
       if (record.plugin.teardown) {
+        teardowns.push(() => record.plugin.teardown!(record.context));
+      }
+      for (const run of teardowns) {
         try {
-          await record.plugin.teardown(record.context);
+          await run();
         } catch (error) {
           this.deps.appLogger.warn('plugin teardown failed', {
             plugin: name,

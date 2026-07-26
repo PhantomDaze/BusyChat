@@ -67,7 +67,6 @@ const MAX_BUFFER_SIZE = 1000;
 const MENTION_CONTEXT_COUNT = 15;
 const SUMMARY_HOUR = 21;
 const SUMMARY_MINUTE = 30;
-const CHECK_INTERVAL_MS = 60_000; // check every 60 seconds
 
 export const manifest: PluginManifest = {
   name: 'auto-memory',
@@ -96,23 +95,64 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function beijingNow(): Date {
-  return new Date(
-    new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }),
-  );
+interface BeijingParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+}
+
+const BEIJING_FORMAT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+});
+
+/**
+ * Read the current wall-clock time in Beijing. Uses formatToParts rather than
+ * `new Date(toLocaleString(...))`, which depends on the host locale being
+ * parseable by the Date constructor and is not reliable across platforms.
+ */
+function beijingParts(at: Date = new Date()): BeijingParts {
+  const parts = BEIJING_FORMAT.formatToParts(at);
+  const read = (type: Intl.DateTimeFormatPartTypes): number => {
+    const found = parts.find((p) => p.type === type)?.value;
+    return found ? Number(found) : 0;
+  };
+  return {
+    year: read('year'),
+    month: read('month'),
+    day: read('day'),
+    hour: read('hour'),
+    minute: read('minute'),
+    second: read('second'),
+  };
 }
 
 function beijingDateString(): string {
-  const d = beijingNow();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  const p = beijingParts();
+  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
 }
 
 function beijingHourMinute(): { hour: number; minute: number } {
-  const d = beijingNow();
-  return { hour: d.getHours(), minute: d.getMinutes() };
+  const p = beijingParts();
+  return { hour: p.hour, minute: p.minute };
+}
+
+/** Milliseconds from now until the next Beijing-time HH:MM (tomorrow if already past). */
+function msUntilBeijingTime(hour: number, minute: number): number {
+  const p = beijingParts();
+  const nowSec = p.hour * 3600 + p.minute * 60 + p.second;
+  const targetSec = hour * 3600 + minute * 60;
+  const deltaSec = targetSec > nowSec ? targetSec - nowSec : targetSec - nowSec + 86_400;
+  return deltaSec * 1000;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,18 +298,43 @@ async function writeState(
   await ctx.storage.set(STATE_KEY, serializeState(state));
 }
 
+let stateLock: Promise<unknown> = Promise.resolve();
+
+/**
+ * Serialized read-modify-write. Message hooks are dispatched fire-and-forget,
+ * so two concurrent handlers doing readState/writeState would otherwise clobber
+ * each other (dropped buffer entries, under-counted totals).
+ */
+async function updateState(
+  ctx: PluginContext,
+  mutator: (state: AutoMemoryState) => AutoMemoryState,
+): Promise<AutoMemoryState> {
+  const run = stateLock.then(async () => {
+    const current = await readState(ctx);
+    const next = mutator(current);
+    await writeState(ctx, next);
+    return next;
+  });
+  stateLock = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 // ---------------------------------------------------------------------------
 // Message relevance helpers
 // ---------------------------------------------------------------------------
 
 function isBotMentioned(event: NormalizedMessageEvent, selfId: string): boolean {
+  // Only trust a real @-segment. Matching the bot's QQ number in plain text
+  // would let any member trigger an LLM call + admin DM just by typing it.
   for (const seg of event.content.segments) {
     if (seg.type === 'at') {
       const qq = seg.data.qq || seg.data.user_id;
       if (qq && qq === selfId) return true;
     }
   }
-  if (event.content.text.includes(`@${selfId}`)) return true;
   return false;
 }
 
@@ -313,7 +378,25 @@ function isRelevantToAdmin(
 // Daily summary
 // ---------------------------------------------------------------------------
 
+let summaryInFlight = false;
+
 async function runDailySummary(ctx: PluginContext): Promise<void> {
+  // Re-entrancy guard: a slow LLM round-trip can outlast the 60s tick interval,
+  // and the tick would otherwise start a second concurrent run (double reports,
+  // duplicate KB entries, and a buffer resurrected after the first run cleared it).
+  if (summaryInFlight) {
+    ctx.logger.info('auto-memory: summary already in progress, skipping');
+    return;
+  }
+  summaryInFlight = true;
+  try {
+    await runDailySummaryInner(ctx);
+  } finally {
+    summaryInFlight = false;
+  }
+}
+
+async function runDailySummaryInner(ctx: PluginContext): Promise<void> {
   const state = await readState(ctx);
   const runtime = await ctx.runtime.snapshot();
 
@@ -330,6 +413,12 @@ async function runDailySummary(ctx: PluginContext): Promise<void> {
 
   const prefs = state.preferences;
   const allMessages = state.messageBuffer;
+  // Remember exactly which messages this run consumed. The model calls below
+  // take a while, and messages arriving meanwhile must survive the buffer
+  // clear rather than being wiped by a stale snapshot.
+  const processedIds = new Set(allMessages.map((m) => m.id));
+  const dropProcessed = (buffer: StoredMessage[]): StoredMessage[] =>
+    buffer.filter((m) => !processedIds.has(m.id));
 
   // Filter by scope preference
   let scopeFiltered = allMessages;
@@ -386,12 +475,12 @@ async function runDailySummary(ctx: PluginContext): Promise<void> {
       }
     }
 
-    // Clear buffer
-    await writeState(ctx, {
-      ...state,
+    // Clear the messages this run consumed, keeping any that arrived since
+    await updateState(ctx, (current) => ({
+      ...current,
       lastSummaryDate: beijingDateString(),
-      messageBuffer: [],
-    });
+      messageBuffer: dropProcessed(current.messageBuffer),
+    }));
     return;
   }
 
@@ -510,13 +599,13 @@ async function runDailySummary(ctx: PluginContext): Promise<void> {
     }
   }
 
-  // Clear buffer and update state
-  await writeState(ctx, {
-    ...state,
+  // Clear the messages this run consumed, keeping any that arrived since
+  await updateState(ctx, (current) => ({
+    ...current,
     lastSummaryDate: dateStr,
-    messageBuffer: [],
-    totalSummariesGenerated: state.totalSummariesGenerated + 1,
-  });
+    messageBuffer: dropProcessed(current.messageBuffer),
+    totalSummariesGenerated: current.totalSummariesGenerated + 1,
+  }));
 
   ctx.logger.info('auto-memory: daily summary generated', {
     date: dateStr,
@@ -622,10 +711,10 @@ async function handleMention(
     }
   }
 
-  await writeState(ctx, {
-    ...state,
-    totalMentionHandled: state.totalMentionHandled + 1,
-  });
+  await updateState(ctx, (current) => ({
+    ...current,
+    totalMentionHandled: current.totalMentionHandled + 1,
+  }));
 
   ctx.logger.info('auto-memory: @mention handled', {
     senderId: event.sender.userId,
@@ -638,37 +727,51 @@ async function handleMention(
 // Timer management
 // ---------------------------------------------------------------------------
 
-let timer: ReturnType<typeof setInterval> | null = null;
+let timer: ReturnType<typeof setTimeout> | null = null;
+let timerStopped = true;
 
-function startTimer(ctx: PluginContext): void {
-  if (timer) return;
+/**
+ * Schedule the next run at exactly 21:30 Beijing time, then re-arm for the
+ * following day. This replaces a 60s poll that only matched during the
+ * 21:30–21:59 window — a stalled event loop or suspended host across that
+ * window skipped the whole day's report while the process stayed up (the
+ * startup catch-up below only rescues full restarts).
+ */
+function scheduleNextRun(ctx: PluginContext): void {
+  if (timerStopped) return;
 
-  timer = setInterval(() => {
+  const delayMs = msUntilBeijingTime(SUMMARY_HOUR, SUMMARY_MINUTE);
+  ctx.logger.info('auto-memory: next daily summary scheduled', {
+    inMinutes: Math.round(delayMs / 60_000),
+    at: `${String(SUMMARY_HOUR).padStart(2, '0')}:${String(SUMMARY_MINUTE).padStart(2, '0')} (Asia/Shanghai)`,
+  });
+
+  timer = setTimeout(() => {
     void (async () => {
       try {
-        const { hour, minute } = beijingHourMinute();
         const today = beijingDateString();
         const state = await readState(ctx);
-
-        // Fire at 21:30 once per day
-        if (
-          hour === SUMMARY_HOUR &&
-          minute >= SUMMARY_MINUTE &&
-          state.lastSummaryDate !== today
-        ) {
-          ctx.logger.info('auto-memory: triggering daily summary', {
-            time: `${hour}:${String(minute).padStart(2, '0')}`,
-            date: today,
-          });
+        if (state.lastSummaryDate !== today) {
+          ctx.logger.info('auto-memory: triggering daily summary', { date: today });
           await runDailySummary(ctx);
         }
       } catch (err) {
-        ctx.logger.error('auto-memory: timer tick failed', {
+        ctx.logger.error('auto-memory: daily summary failed', {
           error: err instanceof Error ? err.message : String(err),
         });
+      } finally {
+        // Always re-arm, even if this run threw, so one bad day doesn't stop
+        // the schedule permanently.
+        scheduleNextRun(ctx);
       }
     })();
-  }, CHECK_INTERVAL_MS);
+  }, delayMs);
+}
+
+function startTimer(ctx: PluginContext): void {
+  if (timer) return;
+  timerStopped = false;
+  scheduleNextRun(ctx);
 
   // Fire immediately on startup if we're past 21:30 and haven't summarized today
   void (async () => {
@@ -696,8 +799,9 @@ function startTimer(ctx: PluginContext): void {
 }
 
 function stopTimer(): void {
+  timerStopped = true;
   if (timer) {
-    clearInterval(timer);
+    clearTimeout(timer);
     timer = null;
   }
 }
@@ -739,7 +843,6 @@ const plugin: BotPlugin = {
             `私聊: ${current.preferences.includePrivate ? '✓' : '✗'}`,
             `群聊: ${current.preferences.includeGroups ? '✓' : '✗'}`,
             `管理员: ${runtime.admins.length > 0 ? runtime.admins.join(', ') : '无'}`,
-            `管理员: ${runtime.admins.length > 0 ? runtime.admins.join(', ') : '无'}`,
           ].join('\n');
         }
 
@@ -756,29 +859,28 @@ const plugin: BotPlugin = {
 
           if (kwAction === 'add') {
             if (!kw) return '用法: /auto-memory keywords add <关键词>';
-            const updated = [
-              ...current.preferences.keywords.filter((k) => k !== kw),
-              kw,
-            ];
-            await writeState(ctx, {
-              ...current,
-              preferences: { ...current.preferences, keywords: updated },
-            });
+            await updateState(ctx, (s) => ({
+              ...s,
+              preferences: {
+                ...s.preferences,
+                keywords: [...s.preferences.keywords.filter((k) => k !== kw), kw],
+              },
+            }));
             return `已添加关键词: ${kw}`;
           }
 
           if (kwAction === 'remove') {
             if (!kw) return '用法: /auto-memory keywords remove <关键词>';
-            const updated = current.preferences.keywords.filter(
-              (k) => k !== kw,
-            );
-            await writeState(ctx, {
-              ...current,
-              preferences: { ...current.preferences, keywords: updated },
+            let removed = false;
+            await updateState(ctx, (s) => {
+              const updated = s.preferences.keywords.filter((k) => k !== kw);
+              removed = updated.length < s.preferences.keywords.length;
+              return {
+                ...s,
+                preferences: { ...s.preferences, keywords: updated },
+              };
             });
-            return updated.length < current.preferences.keywords.length
-              ? `已移除关键词: ${kw}`
-              : `未找到关键词: ${kw}`;
+            return removed ? `已移除关键词: ${kw}` : `未找到关键词: ${kw}`;
           }
         }
 
@@ -806,7 +908,6 @@ const plugin: BotPlugin = {
       const runtime = await ctx.runtime.snapshot();
       const selfId = runtime.onebot.selfId?.trim();
       const adminIds = runtime.admins;
-      const state = await readState(ctx);
 
       const stored: StoredMessage = {
         id: event.id,
@@ -821,29 +922,23 @@ const plugin: BotPlugin = {
         mentionedBot: selfId ? isBotMentioned(event, selfId) : false,
       };
 
-      // Always store relevant messages, sample non-relevant ones
-      const prefs = state.preferences;
-      const isRelevant = isRelevantToAdmin(stored, adminIds, prefs.keywords);
-      const shouldStore =
-        isRelevant ||
-        stored.mentionedBot ||
-        state.messageBuffer.length < prefs.maxMessagesPerDay;
+      await updateState(ctx, (state) => {
+        // Always store relevant messages, sample non-relevant ones
+        const prefs = state.preferences;
+        const isRelevant = isRelevantToAdmin(stored, adminIds, prefs.keywords);
+        const shouldStore =
+          isRelevant ||
+          stored.mentionedBot ||
+          state.messageBuffer.length < prefs.maxMessagesPerDay;
 
-      if (shouldStore) {
-        const newBuffer = [...state.messageBuffer, stored].slice(
-          -MAX_BUFFER_SIZE,
-        );
-        await writeState(ctx, {
+        return {
           ...state,
-          messageBuffer: newBuffer,
+          messageBuffer: shouldStore
+            ? [...state.messageBuffer, stored].slice(-MAX_BUFFER_SIZE)
+            : state.messageBuffer,
           totalMessagesObserved: state.totalMessagesObserved + 1,
-        });
-      } else {
-        await writeState(ctx, {
-          ...state,
-          totalMessagesObserved: state.totalMessagesObserved + 1,
-        });
-      }
+        };
+      });
 
       // Handle @mention if bot is mentioned
       if (stored.mentionedBot && !stored.isAdmin) {
@@ -862,7 +957,6 @@ const plugin: BotPlugin = {
 
     async onAdminMessage(event, ctx) {
       // Admin messages are always relevant - ensure they're stored
-      const state = await readState(ctx);
       const runtime = await ctx.runtime.snapshot();
       const selfId = runtime.onebot.selfId?.trim();
       const adminIds = runtime.admins;
@@ -880,12 +974,11 @@ const plugin: BotPlugin = {
         mentionedBot: selfId ? isBotMentioned(event, selfId) : false,
       };
 
-      const newBuffer = [...state.messageBuffer, stored].slice(-MAX_BUFFER_SIZE);
-      await writeState(ctx, {
+      await updateState(ctx, (state) => ({
         ...state,
-        messageBuffer: newBuffer,
+        messageBuffer: [...state.messageBuffer, stored].slice(-MAX_BUFFER_SIZE),
         totalMessagesObserved: state.totalMessagesObserved + 1,
-      });
+      }));
     },
 
     async onShutdown(ctx) {

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { splitLongText } from './onebot';
+import { chunkWithPrefixBudget } from './onebot';
 import type { ReplyManager } from './reply';
 import type {
   AdviceGenerationContext,
@@ -51,9 +51,11 @@ function compactEvents(events: NormalizedMessageEvent[]): NormalizedMessageEvent
         continue;
       }
     }
-    // Skip pure emoji / single-char messages unless from admin
+    // Skip pure emoji / single-char messages unless from admin. Count by code
+    // points so a multi-byte emoji (JS string length 2) is correctly treated
+    // as one character rather than slipping through the length check.
     const t = event.content.text.trim();
-    if (!event.sender.isAdmin && t.length <= 1 && !/[a-zA-Z0-9]/.test(t)) continue;
+    if (!event.sender.isAdmin && [...t].length <= 1 && !/[a-zA-Z0-9]/.test(t)) continue;
     result.push({ ...event, content: { ...event.content } });
   }
   return result;
@@ -205,6 +207,7 @@ async function getActiveModelId(services: SummaryWorkerDependencies, task: Model
 
 export class SummaryWorker {
   private timer: NodeJS.Timeout | null = null;
+  private flushing = false;
 
   constructor(private readonly deps: SummaryWorkerDependencies) {}
 
@@ -261,6 +264,22 @@ export class SummaryWorker {
   }
 
   async flush(reason: string): Promise<SummaryRecord | null> {
+    // Serialize flushes: an interval tick firing while a previous flush is still
+    // awaiting the model would otherwise read the same cursor, produce a
+    // duplicate summary, and race on the cursor write.
+    if (this.flushing) {
+      this.deps.appLogger.debug('summary flush skipped: already in progress', { reason });
+      return null;
+    }
+    this.flushing = true;
+    try {
+      return await this.flushInner(reason);
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  private async flushInner(reason: string): Promise<SummaryRecord | null> {
     const runtime = await this.deps.runtime.snapshot();
     if (!runtime.summary.enabled) {
       this.deps.appLogger.info('summary flush skipped: disabled');
@@ -272,7 +291,13 @@ export class SummaryWorker {
       this.deps.appLogger.warn('summary flush skipped: no admins configured — use /admin add <QQ> to add recipients');
       return null;
     }
-    const allEvents = await this.deps.storage.listEventsAfter(runtime.summary.cursorEventId);
+    // Fetch one more than the prompt window: the extra row is a backlog probe.
+    // Relying on the storage default (500) breaks backlog detection whenever
+    // maxEventsPerPrompt >= that cap — backlog would always read 0.
+    const allEvents = await this.deps.storage.listEventsAfter(
+      runtime.summary.cursorEventId,
+      runtime.summary.maxEventsPerPrompt + 1,
+    );
     if (allEvents.length === 0) {
       this.deps.appLogger.debug('summary flush skipped: no new events since cursor', {
         cursorEventId: runtime.summary.cursorEventId ?? '(none)',
@@ -280,7 +305,19 @@ export class SummaryWorker {
       return null;
     }
 
-    const limitedEvents = allEvents.slice(-runtime.summary.maxEventsPerPrompt);
+    // Take the OLDEST batch, not the newest. The cursor advances only to the
+    // end of the batch we actually summarize, so a backlog drains over
+    // successive flushes instead of being silently skipped (taking the newest
+    // slice while advancing the cursor to the newest event would permanently
+    // drop everything in between).
+    const limitedEvents = allEvents.slice(0, runtime.summary.maxEventsPerPrompt);
+    const backlog = allEvents.length - limitedEvents.length;
+    if (backlog > 0) {
+      this.deps.appLogger.info('summary backlog: processing oldest batch first', {
+        batchSize: limitedEvents.length,
+        remaining: backlog,
+      });
+    }
     // Context events: include admin messages so AI sees the full conversation
     const contextEvents = limitedEvents.filter((event) => !event.visibility.fromBot);
     // Reportable events: only non-admin non-bot messages for the batch threshold
@@ -300,7 +337,10 @@ export class SummaryWorker {
       return null;
     }
 
-    if (reason === 'interval' && reportableEvents.length < runtime.summary.batchSize) {
+    // The batch threshold avoids summarizing a trickle of chat — but only apply
+    // it when nothing is queued behind this batch, otherwise a backlog whose
+    // oldest slice is under the threshold would block the cursor forever.
+    if (reason === 'interval' && backlog === 0 && reportableEvents.length < runtime.summary.batchSize) {
       return null;
     }
 
@@ -346,11 +386,21 @@ export class SummaryWorker {
 
     const pendingSection = this.deps.replies.formatPendingForSummary();
     const fullText = `摘要：\n${summaryRecord.summaryText}\n\n建议：\n${summaryRecord.suggestionsText}${pendingSection}`;
-    const chunks = splitLongText(fullText, 3800);
+    const chunks = chunkWithPrefixBudget(fullText);
     for (const recipientId of recipients) {
-      for (let i = 0; i < chunks.length; i += 1) {
-        const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
-        await this.deps.bot.sendPrivateMessage(recipientId, prefix + chunks[i]!);
+      // Isolate per recipient: one unreachable admin must not abort delivery to
+      // the others (the cursor has already advanced, so an abort would lose it).
+      try {
+        for (let i = 0; i < chunks.length; i += 1) {
+          const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
+          await this.deps.bot.sendPrivateMessage(recipientId, prefix + chunks[i]!);
+        }
+      } catch (error) {
+        this.deps.appLogger.warn('summary delivery failed for recipient', {
+          recipientId,
+          summaryId: summaryRecord.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 

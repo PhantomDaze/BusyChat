@@ -153,7 +153,10 @@ function createMockStorage(): AppServices['storage'] {
     async listKnowledgeEntriesAfter(): Promise<never[]> {
       return [];
     },
-    async deleteKnowledgeEntry(): Promise<boolean> {
+    async countKnowledgeEntries(): Promise<number> {
+      return 0;
+    },
+    async deleteKnowledgeEntry(): Promise<string | false> {
       return false;
     },
     namespace,

@@ -20,7 +20,7 @@ interface KnowledgeServiceDependencies {
     appendKnowledgeEntry(entry: KnowledgeEntry): Promise<void>;
     listKnowledgeEntries(limit?: number): Promise<KnowledgeEntry[]>;
     listKnowledgeEntriesAfter(cursorId?: string, limit?: number): Promise<KnowledgeEntry[]>;
-    deleteKnowledgeEntry(id: string): Promise<boolean>;
+    deleteKnowledgeEntry(id: string): Promise<string | false>;
   };
   models: ModelAdminGateway;
   appLogger: Logger;
@@ -31,11 +31,15 @@ interface KnowledgeServiceDependencies {
 // ---------------------------------------------------------------------------
 
 function cosineSimilarity(a: number[], b: number[]): number {
+  // Vectors of different dimensions are incomparable — a mismatch means one
+  // side was produced by a different embedding model (e.g. the rule-based
+  // fallback). Returning 0 keeps those entries out of the results instead of
+  // zero-padding them into a bogus non-zero score.
+  if (a.length !== b.length) return 0;
   let dot = 0;
   let normA = 0;
   let normB = 0;
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < a.length; i++) {
     const va = a[i] ?? 0;
     const vb = b[i] ?? 0;
     dot += va * vb;
@@ -97,6 +101,15 @@ export class KnowledgeService implements KnowledgeServiceApi {
     if (!vector || vector.length === 0) {
       throw new Error('embedding model returned empty vector');
     }
+    // Optional strict dimension check: a vector of the wrong width would be
+    // stored but never match anything (cosineSimilarity returns 0 on length
+    // mismatch), so fail loudly instead of persisting a dead entry.
+    const expectedDim = runtime.knowledgeBase.vectorDimension;
+    if (expectedDim && vector.length !== expectedDim) {
+      throw new Error(
+        `embedding dimension mismatch: got ${vector.length}, expected ${expectedDim} (runtime.knowledgeBase.vectorDimension)`,
+      );
+    }
 
     const entry: KnowledgeEntry = {
       id: randomUUID(),
@@ -157,10 +170,12 @@ export class KnowledgeService implements KnowledgeServiceApi {
     const allEntries = await this.deps.storage.listKnowledgeEntries();
     const entryMap = new Map(allEntries.map((e) => [e.id, e]));
 
-    const candidates: KnowledgeEntry[] = [];
+    // Keep each score bound to its entry: an indexed id missing from storage
+    // (e.g. trimmed away) must not shift every following entry's score.
+    const candidates: Array<{ entry: KnowledgeEntry; score: number }> = [];
     for (const candidate of topCandidates) {
       const entry = entryMap.get(candidate.id);
-      if (entry) candidates.push(entry);
+      if (entry) candidates.push({ entry, score: candidate.score });
     }
 
     // Step 4: Rerank if we have more than maxResults
@@ -170,7 +185,7 @@ export class KnowledgeService implements KnowledgeServiceApi {
       try {
         const rerankResponse = await this.deps.models.rerank(
           query,
-          candidates.map((e) => e.text),
+          candidates.map((c) => c.entry.text),
           { source: 'knowledge-search' },
         );
 
@@ -179,10 +194,10 @@ export class KnowledgeService implements KnowledgeServiceApi {
         );
 
         for (let i = 0; i < candidates.length; i++) {
-          const entry = candidates[i]!;
+          const { entry, score } = candidates[i]!;
           const item: KnowledgeQueryResult = {
             entry,
-            similarityScore: topCandidates[i]?.score ?? 0,
+            similarityScore: score,
           };
           const rs = rerankScores.get(i);
           if (rs !== undefined) {
@@ -197,19 +212,13 @@ export class KnowledgeService implements KnowledgeServiceApi {
       } catch {
         // Rerank failed — fall back to similarity-only ordering
         this.deps.appLogger.warn('rerank failed, falling back to similarity');
-        for (let i = 0; i < candidates.length; i++) {
-          results.push({
-            entry: candidates[i]!,
-            similarityScore: topCandidates[i]?.score ?? 0,
-          });
+        for (const { entry, score } of candidates) {
+          results.push({ entry, similarityScore: score });
         }
       }
     } else {
-      for (let i = 0; i < candidates.length; i++) {
-        results.push({
-          entry: candidates[i]!,
-          similarityScore: topCandidates[i]?.score ?? 0,
-        });
+      for (const { entry, score } of candidates) {
+        results.push({ entry, similarityScore: score });
       }
     }
 
@@ -217,19 +226,21 @@ export class KnowledgeService implements KnowledgeServiceApi {
   }
 
   async delete(id: string): Promise<boolean> {
-    // Remove from in-memory index
+    // Delete from storage first — it resolves prefix ids to the exact id that
+    // was actually removed, which we then use to keep the in-memory index in
+    // sync (a plain `id !== item.id` filter would miss prefix deletions).
+    const matchedId = await this.deps.storage.deleteKnowledgeEntry(id);
+
+    const targetId = matchedId || id;
     const before = this.vectorIndex.length;
-    this.vectorIndex = this.vectorIndex.filter((item) => item.id !== id);
+    this.vectorIndex = this.vectorIndex.filter((item) => item.id !== targetId);
     const removed = this.vectorIndex.length < before;
 
-    // Remove from persistent storage
-    const storageRemoved = await this.deps.storage.deleteKnowledgeEntry(id);
-
-    if (removed || storageRemoved) {
-      this.deps.appLogger.debug('knowledge entry deleted', { id });
+    if (removed || matchedId) {
+      this.deps.appLogger.debug('knowledge entry deleted', { id: targetId });
     }
 
-    return removed || storageRemoved;
+    return removed || Boolean(matchedId);
   }
 
   async list(limit?: number): Promise<KnowledgeEntry[]> {

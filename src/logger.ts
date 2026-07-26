@@ -12,7 +12,30 @@ function serializeMeta(meta?: JsonObject): string {
   }
 }
 
-function write(level: string, scope: string, message: string, meta?: JsonObject): void {
+type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
+
+const LEVEL_ORDER: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+  silent: 100,
+};
+
+function resolveThreshold(): number {
+  const raw = (process.env.LOG_LEVEL ?? '').trim().toLowerCase();
+  const known = Object.prototype.hasOwnProperty.call(LEVEL_ORDER, raw);
+  // Default to `info`: debug logs fire on every incoming message, which is far
+  // too noisy for a normally-running bot.
+  return known ? LEVEL_ORDER[raw as LogLevel] : LEVEL_ORDER.info;
+}
+
+// Read once at startup so the level check stays cheap on the hot path.
+const THRESHOLD = resolveThreshold();
+
+function write(level: LogLevel, scope: string, message: string, meta?: JsonObject): void {
+  if (LEVEL_ORDER[level] < THRESHOLD) return;
+
   const line = `[${new Date().toISOString()}] [${level}] [${scope}] ${message}${serializeMeta(meta)}`;
   if (level === 'error') {
     console.error(line);

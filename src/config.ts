@@ -163,7 +163,8 @@ export function createDefaultKnowledgeBaseSettings(): KnowledgeBaseSettings {
   return {
     enabled: true,
     maxResults: 10,
-    vectorDimension: 768,
+    // No default vectorDimension: the actual width is decided by the embedding
+    // model. Set it explicitly only if you want strict dimension validation.
   };
 }
 
@@ -213,14 +214,23 @@ export function createDefaultAppConfig(): AppConfigFile {
   };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 function mergePluginStates(
   base: Record<string, PluginRuntimeState>,
   patch: Record<string, PluginRuntimeState>,
 ): Record<string, PluginRuntimeState> {
   const merged: Record<string, PluginRuntimeState> = { ...base };
   for (const [name, state] of Object.entries(patch)) {
+    // Skip documentation keys ("_comment") and anything that isn't an object —
+    // otherwise the template's comment string becomes a phantom plugin entry.
+    if (name.startsWith('_') || !isPlainObject(state)) continue;
     merged[name] = {
-      enabled: Boolean(state.enabled),
+      // Absent `enabled` means enabled — an operator hand-adding a plugin's
+      // config block should not silently disable the plugin.
+      enabled: state.enabled !== false,
       config: { ...(state.config ?? {}) },
     };
   }
@@ -325,17 +335,21 @@ export function normalizeRuntimeState(persisted?: Partial<RuntimeState>): Runtim
   if (typeof summaryEnabled === 'boolean') {
     summary.enabled = summaryEnabled;
   }
+  // Clamp at the normalization layer so EVERY write path is covered — the
+  // WebUI config editor posts raw JSON that bypasses per-route validation,
+  // and an unclamped intervalMs of 1 becomes a setInterval hot loop that
+  // burns CPU and model credit.
   const summaryInterval = toPositiveInteger(persistedSummary?.intervalMs);
   if (summaryInterval) {
-    summary.intervalMs = summaryInterval;
+    summary.intervalMs = Math.min(Math.max(summaryInterval, 5_000), 24 * 60 * 60 * 1000);
   }
   const summaryBatchSize = toPositiveInteger(persistedSummary?.batchSize);
   if (summaryBatchSize) {
-    summary.batchSize = summaryBatchSize;
+    summary.batchSize = Math.min(summaryBatchSize, 1000);
   }
   const summaryWindow = toPositiveInteger(persistedSummary?.maxEventsPerPrompt);
   if (summaryWindow) {
-    summary.maxEventsPerPrompt = summaryWindow;
+    summary.maxEventsPerPrompt = Math.min(summaryWindow, 500);
   }
   const cursorEventId = toTrimmedString(persistedSummary?.cursorEventId);
   if (cursorEventId) {
@@ -390,6 +404,8 @@ export function normalizeRuntimeState(persisted?: Partial<RuntimeState>): Runtim
   const persistedActiveModels = persisted.activeModels;
   if (persistedActiveModels) {
     for (const [task, modelId] of Object.entries(persistedActiveModels) as Array<[ModelTask, string | undefined]>) {
+      // Skip documentation keys so "_comment" never becomes a task binding.
+      if (task.startsWith('_')) continue;
       const normalizedModelId = toTrimmedString(modelId);
       if (normalizedModelId) {
         activeModels[task] = normalizedModelId;
@@ -429,14 +445,34 @@ export function normalizeRuntimeState(persisted?: Partial<RuntimeState>): Runtim
   };
 }
 
+/**
+ * Copy `_`-prefixed keys (documentation/comments, e.g. "_comment") from the
+ * user's file back into the normalized output, recursing into matching nested
+ * objects. The app rewrites config.json on every runtime update, and without
+ * this every annotation the operator wrote would be silently destroyed within
+ * minutes of startup.
+ */
+function preserveCommentKeys(source: unknown, target: unknown): void {
+  if (!isPlainObject(source) || !isPlainObject(target)) return;
+  for (const [key, value] of Object.entries(source)) {
+    if (key.startsWith('_')) {
+      (target as Record<string, unknown>)[key] = value;
+    } else if (isPlainObject(value) && isPlainObject(target[key])) {
+      preserveCommentKeys(value, target[key]);
+    }
+  }
+}
+
 export function normalizeAppConfig(persisted?: Partial<AppConfigFile>): AppConfigFile {
   const defaults = createDefaultAppConfig();
   if (!persisted) {
     return defaults;
   }
 
-  return {
+  const normalized: AppConfigFile = {
     settings: normalizeAppSettings(persisted.settings),
     runtime: normalizeRuntimeState(persisted.runtime),
   };
+  preserveCommentKeys(persisted, normalized);
+  return normalized;
 }

@@ -18,6 +18,16 @@ interface CommandBusDependencies {
   appLogger: AppServices['appLogger'];
 }
 
+/** Validate an HH:MM time and return it zero-padded, or null if malformed. */
+function normalizeHhmm(value: string): string | null {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const h = Number(match[1]);
+  const m = Number(match[2]);
+  if (h > 23 || m > 59) return null;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
 function tokenizeCommand(input: string): string[] {
   const tokens: string[] = [];
   let current = '';
@@ -33,7 +43,9 @@ function tokenizeCommand(input: string): string[] {
       continue;
     }
 
-    if (char === '"' || char === "'") {
+    // Only treat a quote as opening when we're at a token boundary, so a
+    // mid-word apostrophe (it's, don't) is kept literally instead of eaten.
+    if ((char === '"' || char === "'") && current === '') {
       quote = char;
       continue;
     }
@@ -211,6 +223,35 @@ export function registerBuiltinCommands(services: AppServices, replies?: ReplyMa
     adminOnly: true,
     owner: 'builtin',
     execute: async () => formatCommandHelp(bus.list()),
+  });
+
+  bus.register({
+    name: 'status',
+    description: '查看机器人运行状态',
+    usage: '/status',
+    adminOnly: true,
+    owner: 'builtin',
+    execute: async () => {
+      const runtime = await services.runtime.snapshot();
+      const models = await services.models.listModels();
+      const summaryStatus = await services.summaries.status();
+      const kbCount = await services.storage.countKnowledgeEntries();
+      const pendingCount = replies ? replies.listPending().length : 0;
+      const activeModels = formatActiveTaskModels(models);
+      const ws = runtime.onebot.webSocket;
+
+      return [
+        '🤖 机器人状态',
+        `管理员: ${runtime.admins.length > 0 ? runtime.admins.join(', ') : '未配置'}`,
+        `WebSocket: ${ws.mode}${ws.mode === 'forward' || ws.mode === 'both' ? ` → ${ws.forwardUrl || '(未填地址)'}` : ''}`,
+        `摘要: ${summaryStatus.enabled ? `每 ${Math.round(summaryStatus.intervalMs / 1000)}s，≥${summaryStatus.batchSize} 条触发` : '已停用'}${summaryStatus.lastGeneratedAt ? `，上次 ${summaryStatus.lastGeneratedAt.slice(0, 19).replace('T', ' ')}` : ''}`,
+        `知识库: ${runtime.knowledgeBase.enabled ? `${kbCount} 条` : '已禁用'}`,
+        `待回复: ${pendingCount} 条${pendingCount > 0 ? '（/reply list 查看）' : ''}`,
+        '',
+        '任务模型绑定:',
+        activeModels || '- 无（仅规则回退，请配置真实模型）',
+      ].join('\n');
+    },
   });
 
   bus.register({
@@ -456,10 +497,20 @@ export function registerBuiltinCommands(services: AppServices, replies?: ReplyMa
           return '免打扰已关闭。';
         }
         if (start && end) {
+          // Normalize + validate to zero-padded HH:MM so downstream comparison
+          // (which is order-sensitive for overnight windows) always works.
+          const normStart = normalizeHhmm(start.trim());
+          const normEnd = normalizeHhmm(end.trim());
+          if (!normStart || !normEnd) {
+            return '时间格式无效，请使用 HH:MM (如 /notify quiet 23:00 07:00)。';
+          }
+          if (normStart === normEnd) {
+            return '开始与结束时间不能相同。';
+          }
           await services.runtime.update((state) => {
-            state.quietHours = { start: start!.trim(), end: end!.trim() };
+            state.quietHours = { start: normStart, end: normEnd };
           });
-          return `免打扰时段已设为 ${start!.trim()} - ${end!.trim()}（含关键词的紧急消息仍会在非免打扰时段通知）。`;
+          return `免打扰时段已设为 ${normStart} - ${normEnd}（含关键词的紧急消息仍会在非免打扰时段通知）。`;
         }
         return '用法: /notify quiet <开始时间> <结束时间> (如 /notify quiet 23:00 07:00)';
       }
@@ -511,6 +562,10 @@ export function registerBuiltinCommands(services: AppServices, replies?: ReplyMa
 
       const pending = replies.getPending(replyId);
       if (!pending) return `未找到待回复消息: ${replyId}（可用 /reply list 查看全部）`;
+      if (pending.status !== 'pending') {
+        const label = pending.status === 'replied' ? '已回复' : '已忽略';
+        return `该消息${label}，无法重复处理: ${replyId}`;
+      }
 
       try {
         const result = await replies.generateReply(pending, instruction);
@@ -555,8 +610,12 @@ export function registerBuiltinCommands(services: AppServices, replies?: ReplyMa
     adminOnly: true,
     owner: 'builtin',
     execute: async (ctx) => {
-      const maybeLimit = parseInt(ctx.args[ctx.args.length - 1]!, 10);
-      const hasLimit = Number.isFinite(maybeLimit) && maybeLimit > 0;
+      // Only treat a trailing token as a result count when it's a plausible
+      // count (1–50) AND there is other query text — otherwise a query ending
+      // in a number (room 302, year 2024) would be silently truncated.
+      const lastArg = ctx.args[ctx.args.length - 1];
+      const maybeLimit = /^\d+$/.test(lastArg ?? '') ? parseInt(lastArg!, 10) : NaN;
+      const hasLimit = ctx.args.length > 1 && maybeLimit >= 1 && maybeLimit <= 50;
       const queryEnd = hasLimit ? ctx.args.length - 1 : ctx.args.length;
       const query = ctx.args.slice(0, queryEnd).join(' ');
       if (!query) return '用法: /recall <查询内容> [返回数量]';

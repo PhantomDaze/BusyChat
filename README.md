@@ -33,8 +33,13 @@ First run creates `config.json` from [`config.example.json`](./config.example.js
 npm run typecheck          # TypeScript type check
 npm run test:ws            # WebSocket forward & reverse (18 tests)
 npm run test:kb            # Knowledge base (14 tests)
+npm run test:cmd           # Command permissions (3 tests)
+npm run test:logic         # Chunking, storage durability, reply routing (12 tests)
+npm run test:webui         # WebUI auth/session/redaction against a live server (19 tests)
 npm run test:all           # All of the above
 ```
+
+Set `LOG_LEVEL=debug|info|warn|error|silent` to control log verbosity (default `info`).
 
 ## Configuration
 
@@ -105,9 +110,12 @@ Any endpoint compatible with `/v1/chat/completions` works. Example with DeepSeek
 
 Send `/help` in QQ to see the full list. All commands accept Chinese instructions.
 
+All commands are only processed when sent by a configured admin (`runtime.admins`).
+
 | Command | Description | Access |
 |---|---|---|
-| `/help` | List all available commands | anyone |
+| `/help` | List all available commands | admin |
+| `/status` | Show bot health: WS, models, KB, pending replies | admin |
 | `/summary now` | Generate & send summary immediately | admin |
 | `/summary status` | Show summary config | admin |
 | `/report list` | View recent summaries | admin |

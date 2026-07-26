@@ -23,6 +23,7 @@ interface PendingAction {
   resolve(value: OneBotActionResponse<unknown>): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
+  ws: WebSocket;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +84,19 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
   private reverseClients = new Map<WebSocket, Record<string, unknown>>();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private stopped = true;
+  private connecting = false;
   private pending = new Map<string, PendingAction>();
+
+  /** Pick a socket that is actually OPEN, preferring the forward connection. */
+  private pickReadySocket(): WebSocket | null {
+    if (this.forwardWs && this.forwardWs.readyState === WebSocket.OPEN) {
+      return this.forwardWs;
+    }
+    for (const ws of this.reverseClients.keys()) {
+      if (ws.readyState === WebSocket.OPEN) return ws;
+    }
+    return null;
+  }
 
   constructor(private readonly deps: OneBotWebSocketTransportDependencies) {}
 
@@ -124,6 +137,7 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.connecting = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -143,6 +157,25 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
       ws.close();
     }
     this.reverseClients.clear();
+  }
+
+  /** Release the reverse WebSocket server. Call once, at application shutdown. */
+  async dispose(): Promise<void> {
+    await this.stop();
+    const wss = this.reverseWss;
+    if (!wss) return;
+    this.reverseWss = null;
+    // Bound the wait: wss.close() waits for every tracked client's close
+    // handshake, and a half-dead peer would otherwise stall shutdown (keeping
+    // the store flush from ever running).
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 3_000);
+      timer.unref?.();
+      wss.close(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   async restart(): Promise<void> {
@@ -179,8 +212,8 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
     params: Record<string, unknown>,
     config: OneBotClientConfig,
   ): Promise<OneBotActionResponse<T>> {
-    const ws = this.forwardWs ?? [...this.reverseClients.keys()][0];
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    const ws = this.pickReadySocket();
+    if (!ws) {
       throw new Error('onebot websocket is not connected');
     }
 
@@ -197,6 +230,7 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
         resolve: (value) => resolve(value as OneBotActionResponse<T>),
         reject,
         timer,
+        ws,
       });
 
       try {
@@ -214,6 +248,11 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
   // -----------------------------------------------------------------------
 
   private async handleReverseUpgrade(request: IncomingMessage, socket: Socket, head: Buffer): Promise<void> {
+    if (this.stopped) {
+      rejectUpgrade(socket, 503, 'Service Unavailable');
+      return;
+    }
+
     const runtime = await this.deps.runtime.snapshot();
     const wsConfig = runtime.onebot.webSocket;
 
@@ -266,9 +305,11 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
       this.reverseClients.delete(ws);
       if (this.forwardWs === ws) {
         this.forwardWs = null;
-        void this.scheduleForwardReconnectFromConfig();
+        void this.scheduleForwardReconnectFromConfig().catch(() => undefined);
       }
-      this.rejectAllPending(new Error(`onebot ${label} websocket closed`));
+      // Only reject actions that were sent on THIS socket — a different, still
+      // healthy socket may have unrelated calls in flight.
+      this.rejectPendingForSocket(ws, new Error(`onebot ${label} websocket closed`));
       this.deps.appLogger.info(`onebot ${label} websocket disconnected`);
     });
 
@@ -311,6 +352,13 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
         pending.resolve(value as unknown as OneBotActionResponse<unknown>);
         return;
       }
+      // An echo we issued but already timed out. It is an action response, not
+      // an event — dropping it avoids a pointless event-pipeline round trip
+      // (and a config read) per late reply.
+      if (echo.startsWith('f261agent:')) {
+        this.deps.appLogger.debug('discarded late onebot action response', { echo });
+        return;
+      }
     }
 
     await this.deps.handleIncomingEvent(value, headers);
@@ -331,7 +379,7 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
         this.deps.appLogger.warn('onebot forward websocket connect failed', {
           error: error instanceof Error ? error.message : String(error),
         });
-        void this.scheduleForwardReconnectFromConfig();
+        void this.scheduleForwardReconnectFromConfig().catch(() => undefined);
       });
     }, delayMs);
   }
@@ -345,6 +393,11 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
   }
 
   private async connectForward(): Promise<void> {
+    // Guard against overlapping connects (e.g. a restart landing mid-handshake),
+    // which would otherwise orphan a socket that stop() can't reach.
+    if (this.connecting) return;
+    if (this.forwardWs && this.forwardWs.readyState === WebSocket.OPEN) return;
+
     const runtime = await this.deps.runtime.snapshot();
     const wsConfig = runtime.onebot.webSocket;
 
@@ -357,8 +410,25 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
       return;
     }
 
+    this.connecting = true;
+    try {
+      await this.connectForwardInner(runtime, wsConfig.forwardUrl);
+    } catch (error) {
+      // Every failure path (invalid URL, synchronous WebSocket constructor
+      // throw, handshake error) must reset the guard, or the reconnect loop is
+      // permanently dead: the next attempt would hit `if (this.connecting)`
+      // above, resolve successfully, and never reschedule.
+      this.connecting = false;
+      throw error;
+    }
+  }
+
+  private async connectForwardInner(
+    runtime: Awaited<ReturnType<RuntimeStore['snapshot']>>,
+    forwardUrl: string,
+  ): Promise<void> {
     // Append access_token to query string if configured
-    const url = new URL(wsConfig.forwardUrl);
+    const url = new URL(forwardUrl);
     if (runtime.onebot.accessToken && !url.searchParams.has('access_token')) {
       url.searchParams.set('access_token', runtime.onebot.accessToken);
     }
@@ -380,35 +450,42 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
         handshakeTimeout: runtime.onebot.timeoutMs,
       });
 
-      const timer = setTimeout(() => {
+      const finish = (fn: () => void): void => {
         if (settled) return;
         settled = true;
-        ws.close();
-        reject(new Error('onebot forward websocket connect timed out'));
+        this.connecting = false;
+        clearTimeout(timer);
+        fn();
+      };
+
+      const timer = setTimeout(() => {
+        finish(() => {
+          ws.close();
+          reject(new Error('onebot forward websocket connect timed out'));
+        });
       }, runtime.onebot.timeoutMs);
 
       ws.on('open', () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.forwardWs = ws;
-        this.setupClient(ws, headers, 'forward');
-        this.deps.appLogger.info('onebot forward websocket connected', { url: wsConfig.forwardUrl ?? '' });
-        resolve();
+        finish(() => {
+          // If we were stopped mid-handshake, don't adopt the socket.
+          if (this.stopped) {
+            ws.close();
+            resolve();
+            return;
+          }
+          this.forwardWs = ws;
+          this.setupClient(ws, headers, 'forward');
+          this.deps.appLogger.info('onebot forward websocket connected', { url: forwardUrl });
+          resolve();
+        });
       });
 
       ws.on('error', (error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
+        finish(() => reject(error));
       });
 
       ws.on('unexpected-response', (_ws, response) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(new Error(`onebot forward websocket rejected: ${response.statusCode}`));
+        finish(() => reject(new Error(`onebot forward websocket rejected: ${response.statusCode}`)));
       });
     });
   }
@@ -419,6 +496,15 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
 
   private rejectAllPending(error: Error): void {
     for (const [echo, pending] of this.pending.entries()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+      this.pending.delete(echo);
+    }
+  }
+
+  private rejectPendingForSocket(ws: WebSocket, error: Error): void {
+    for (const [echo, pending] of this.pending.entries()) {
+      if (pending.ws !== ws) continue;
       clearTimeout(pending.timer);
       pending.reject(error);
       this.pending.delete(echo);

@@ -53,12 +53,69 @@ function stringifyMessageSegment(segment: OneBotMessageSegment): string {
   }
 }
 
+function unescapeCqText(value: string): string {
+  return value.replace(/&#91;/g, '[').replace(/&#93;/g, ']').replace(/&amp;/g, '&');
+}
+
+function unescapeCqParam(value: string): string {
+  return value
+    .replace(/&#91;/g, '[')
+    .replace(/&#93;/g, ']')
+    .replace(/&#44;/g, ',')
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * Decode a CQ-code string message ("hello [CQ:at,qq=123] world") into
+ * segments. OneBot v11 implementations configured with
+ * `post_message_format: string` deliver messages this way; without decoding,
+ * every segment-based feature (@-mention detection, media labeling) is blind
+ * and raw CQ markup leaks into stored text and LLM prompts.
+ */
+export function parseCqString(message: string): OneBotMessageSegment[] {
+  const segments: OneBotMessageSegment[] = [];
+  const re = /\[CQ:([a-zA-Z0-9_.-]+)((?:,[^,[\]]*)*)\]/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(message)) !== null) {
+    if (match.index > last) {
+      segments.push({ type: 'text', data: { text: unescapeCqText(message.slice(last, match.index)) } });
+    }
+    const data: Record<string, string> = {};
+    for (const part of (match[2] ?? '').split(',')) {
+      if (!part) continue;
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      data[part.slice(0, eq)] = unescapeCqParam(part.slice(eq + 1));
+    }
+    segments.push({ type: match[1]!, data });
+    last = re.lastIndex;
+  }
+  if (last < message.length) {
+    segments.push({ type: 'text', data: { text: unescapeCqText(message.slice(last)) } });
+  }
+  return segments;
+}
+
+/** Coerce segment data values to strings — implementations send numbers too. */
+function coerceSegmentData(data: Record<string, unknown> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(data ?? {})) {
+    if (value === null || value === undefined) continue;
+    out[key] = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  }
+  return out;
+}
+
 function normalizeSegments(message: OneBotIncomingEvent['message']): OneBotMessageSegment[] {
   if (Array.isArray(message)) {
     return message.map((segment) => ({
       type: segment.type,
-      data: { ...segment.data },
+      data: coerceSegmentData(segment.data as Record<string, unknown> | undefined),
     }));
+  }
+  if (typeof message === 'string') {
+    return parseCqString(message);
   }
   return [];
 }
@@ -68,7 +125,9 @@ function extractPlainText(message: OneBotIncomingEvent['message'], rawText?: str
     return message.map((segment) => stringifyMessageSegment(segment)).join('').trim();
   }
   if (typeof message === 'string') {
-    return message.trim();
+    // Render via the decoded segments so CQ markup becomes readable labels
+    // ("[图片]", "@123...") instead of raw [CQ:...] noise in stored text.
+    return parseCqString(message).map(stringifyMessageSegment).join('').trim();
   }
   return rawText?.trim() || '';
 }
@@ -110,10 +169,21 @@ export function normalizeOneBotMessageEvent(
     return null;
   }
 
-  const scope = payload.message_type === 'group' ? 'group' : 'private';
+  // Only accept the two known message types. Treating an unknown/missing
+  // message_type as private would misclassify events and trigger the wrong
+  // pipelines (e.g. per-message advice for what was actually group chat).
+  if (payload.message_type !== 'group' && payload.message_type !== 'private') {
+    return null;
+  }
+  const scope = payload.message_type;
+  // A group message without a group id can't be attributed to a conversation —
+  // dropping it beats merging unrelated groups into one "group:unknown" bucket.
+  if (scope === 'group' && payload.group_id === undefined) {
+    return null;
+  }
   const conversationId =
     scope === 'group'
-      ? `group:${String(payload.group_id ?? 'unknown')}`
+      ? `group:${String(payload.group_id)}`
       : `private:${senderId}`;
   const botSelfId = getSelfId(payload, runtime);
   const isBot = botSelfId ? senderId === botSelfId : false;
@@ -175,13 +245,38 @@ async function callAction<T>(
     signal: AbortSignal.timeout(config.timeoutMs),
   });
 
-  const payload = (await response.json()) as OneBotActionResponse<T>;
-  if (!response.ok || payload.status === 'failed') {
+  // Read the body as text first so a non-JSON error page (e.g. a 502 from a
+  // reverse proxy) yields a useful status message instead of a JSON parse error.
+  const bodyText = await response.text();
+  let payload: OneBotActionResponse<T> | undefined;
+  try {
+    payload = bodyText ? (JSON.parse(bodyText) as OneBotActionResponse<T>) : undefined;
+  } catch {
+    payload = undefined;
+  }
+
+  if (!response.ok || !payload || payload.status === 'failed') {
     throw new Error(
-      payload.message || `OneBot action ${action} failed with status ${response.status}`,
+      payload?.message || `OneBot action ${action} failed with status ${response.status}`,
     );
   }
   return payload;
+}
+
+// QQ's practical single-message ceiling, and the room reserved for the
+// "[i/n] " progress prefix added when a message spans multiple chunks.
+const MAX_MESSAGE_LEN = 3800;
+const PREFIX_RESERVE = 16;
+
+/**
+ * Split text so that even after the "[i/n] " prefix is prepended, no message
+ * exceeds MAX_MESSAGE_LEN. A single-chunk message carries no prefix, so it is
+ * allowed the full length; only multi-chunk output reserves prefix room.
+ */
+export function chunkWithPrefixBudget(text: string): string[] {
+  const full = splitLongText(text, MAX_MESSAGE_LEN);
+  if (full.length <= 1) return full;
+  return splitLongText(text, MAX_MESSAGE_LEN - PREFIX_RESERVE);
 }
 
 export function splitLongText(text: string, maxLen: number): string[] {
@@ -212,13 +307,15 @@ export function splitLongText(text: string, maxLen: number): string[] {
       continue;
     }
 
-    // Then sentence boundaries (Chinese + English punctuation)
+    // Then sentence boundaries (Chinese + English punctuation).
+    // Search within maxLen-1 so the inclusive slice(0, splitAt + 1) never
+    // exceeds maxLen characters.
     splitAt = Math.max(
-      remaining.lastIndexOf('。', maxLen),
-      remaining.lastIndexOf('！', maxLen),
-      remaining.lastIndexOf('？', maxLen),
-      remaining.lastIndexOf('；', maxLen),
-      remaining.lastIndexOf('. ', maxLen),
+      remaining.lastIndexOf('。', maxLen - 1),
+      remaining.lastIndexOf('！', maxLen - 1),
+      remaining.lastIndexOf('？', maxLen - 1),
+      remaining.lastIndexOf('；', maxLen - 1),
+      remaining.lastIndexOf('. ', maxLen - 1),
     );
     if (splitAt > maxLen * 0.4) {
       chunks.push(remaining.slice(0, splitAt + 1).trimEnd());
@@ -281,7 +378,7 @@ export class OneBotClient implements BotGateway {
 
   /** Send a potentially long text as chunked messages. Splits at paragraph / sentence boundaries. */
   async sendLongPrivateMessage(userId: string, text: string): Promise<void> {
-    const chunks = splitLongText(text, 3800);
+    const chunks = chunkWithPrefixBudget(text);
     const total = chunks.length;
     for (let i = 0; i < total; i += 1) {
       const prefix = total > 1 ? `[${i + 1}/${total}] ` : '';
@@ -291,7 +388,7 @@ export class OneBotClient implements BotGateway {
 
   /** Send a potentially long text as chunked messages to a group. */
   async sendLongGroupMessage(groupId: string, text: string): Promise<void> {
-    const chunks = splitLongText(text, 3800);
+    const chunks = chunkWithPrefixBudget(text);
     const total = chunks.length;
     for (let i = 0; i < total; i += 1) {
       const prefix = total > 1 ? `[${i + 1}/${total}] ` : '';

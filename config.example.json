@@ -98,8 +98,7 @@
       "maxResults": 10,
       "_maxResults": "搜索返回的最大结果数。",
 
-      "vectorDimension": 768,
-      "_vectorDimension": "向量维度。rule-based fallback 为 8；OpenAI 兼容嵌入模型通常为 768 或 1024。"
+      "_vectorDimension": "可选。设置后将严格校验嵌入向量维度（不符则报错拒绝入库）；不设置则不校验。例如 \"vectorDimension\": 1024。"
     },
 
     "activeModels": {

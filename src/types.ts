@@ -159,7 +159,12 @@ export interface KnowledgeEntry {
 export interface KnowledgeBaseSettings {
   enabled: boolean;
   maxResults: number;
-  vectorDimension: number;
+  /**
+   * Expected embedding width. Optional: when set, KnowledgeService.add rejects
+   * vectors of any other length (guarding against a misconfigured provider);
+   * when absent, no dimension check is performed.
+   */
+  vectorDimension?: number;
 }
 
 export interface KnowledgeQueryResult {
@@ -506,7 +511,8 @@ export interface AppServices {
     appendKnowledgeEntry(entry: KnowledgeEntry): Promise<void>;
     listKnowledgeEntries(limit?: number): Promise<KnowledgeEntry[]>;
     listKnowledgeEntriesAfter(cursorId?: string, limit?: number): Promise<KnowledgeEntry[]>;
-    deleteKnowledgeEntry(id: string): Promise<boolean>;
+    countKnowledgeEntries(): Promise<number>;
+    deleteKnowledgeEntry(id: string): Promise<string | false>;
     namespace(name: string): NamespacedStorage;
   };
   commands: {

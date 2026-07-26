@@ -25,6 +25,24 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+/** Coerce a config value to a positive timeout, guarding against NaN/garbage. */
+function resolveTimeoutMs(value: unknown, fallback = 30_000): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Strip anything resembling a bearer token / api key out of an upstream error
+ * body before it reaches the logs. Providers occasionally echo the request
+ * (including the Authorization header) in their 4xx bodies.
+ */
+function redactSecrets(text: string): string {
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]')
+    .replace(/\bsk-[A-Za-z0-9._-]{8,}/g, 'sk-[redacted]')
+    .replace(/("?(?:api[_-]?key|authorization|token)"?\s*[:=]\s*"?)[^"\s,}]+/gi, '$1[redacted]');
+}
+
 function tokenize(text: string): string[] {
   return text
     .toLowerCase()
@@ -193,7 +211,7 @@ class OpenAICompatibleProvider implements ModelProvider {
     }
 
     const apiKey = String(request.config.parameters.apiKey ?? '').trim();
-    const timeoutMs = Number(request.config.parameters.timeoutMs ?? 30_000);
+    const timeoutMs = resolveTimeoutMs(request.config.parameters.timeoutMs);
     const systemPrompt = String(request.config.parameters.systemPrompt ?? '').trim();
     const temperature = request.config.parameters.temperature;
     const maxTokens = request.config.parameters.maxTokens;
@@ -263,7 +281,7 @@ class OpenAICompatibleProvider implements ModelProvider {
     }
 
     const apiKey = String(request.config.parameters.apiKey ?? '').trim();
-    const timeoutMs = Number(request.config.parameters.timeoutMs ?? 30_000);
+    const timeoutMs = resolveTimeoutMs(request.config.parameters.timeoutMs);
 
     const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
     const response = await fetch(new URL('embeddings', normalizedBase), {
@@ -282,7 +300,7 @@ class OpenAICompatibleProvider implements ModelProvider {
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       throw new Error(
-        `openai-compatible embedding failed: ${response.status}${body ? ` - ${body.slice(0, 200)}` : ''}`,
+        `openai-compatible embedding failed: ${response.status}${body ? ` - ${redactSecrets(body).slice(0, 200)}` : ''}`,
       );
     }
 
@@ -309,7 +327,7 @@ class OpenAICompatibleProvider implements ModelProvider {
     }
 
     const apiKey = String(request.config.parameters.apiKey ?? '').trim();
-    const timeoutMs = Number(request.config.parameters.timeoutMs ?? 30_000);
+    const timeoutMs = resolveTimeoutMs(request.config.parameters.timeoutMs);
 
     const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
     const response = await fetch(new URL('rerank', normalizedBase), {
@@ -329,7 +347,7 @@ class OpenAICompatibleProvider implements ModelProvider {
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       throw new Error(
-        `openai-compatible rerank failed: ${response.status}${body ? ` - ${body.slice(0, 200)}` : ''}`,
+        `openai-compatible rerank failed: ${response.status}${body ? ` - ${redactSecrets(body).slice(0, 200)}` : ''}`,
       );
     }
 
@@ -617,11 +635,18 @@ export class ModelRegistry implements ModelAdminGateway {
       try {
         return await provider.embed(request);
       } catch (error) {
-        this.logger.warn('embedding provider failed, falling back', {
-          modelId: model.id,
-          provider: model.provider,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        // Do NOT silently fall back to the rule-based embedder here: it emits a
+        // vector of a different dimension, which would be persisted next to the
+        // real ones and permanently pollute the knowledge base. Surface the
+        // failure so the caller can retry rather than store garbage.
+        if (model.provider !== 'rule-based') {
+          this.logger.warn('embedding provider failed', {
+            modelId: model.id,
+            provider: model.provider,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error instanceof Error ? error : new Error(String(error));
+        }
       }
     }
 

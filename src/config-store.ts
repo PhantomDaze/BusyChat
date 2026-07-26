@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile, rename, stat, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
@@ -33,7 +33,11 @@ async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
 }
 
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
-  await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  // Write to a temp file then atomically rename over the target, so a crash
+  // mid-write can never leave a truncated (and thus unparseable) config.json.
+  const tmpPath = `${filePath}.tmp`;
+  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await rename(tmpPath, filePath);
 }
 
 function clone<T>(value: T): T {
@@ -82,6 +86,8 @@ export async function saveAppConfigFile(filePath: string, config: AppConfigFile)
 
 export class JsonConfigStore implements AppConfigStore {
   private lock: Promise<void> = Promise.resolve();
+  private cache: AppConfigFile | null = null;
+  private cacheMtimeMs = -1;
 
   constructor(private readonly filePath: string = DEFAULT_CONFIG_PATH) {}
 
@@ -91,12 +97,41 @@ export class JsonConfigStore implements AppConfigStore {
     return run;
   }
 
+  private async fileMtimeMs(): Promise<number> {
+    try {
+      return (await stat(this.filePath)).mtimeMs;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * Cached read, invalidated by the file's mtime: a cheap stat per access
+   * (instead of a full read+parse) while still honoring config.json edits made
+   * on disk while the app runs — the documented workflow for headless setups.
+   */
+  private async loadCached(): Promise<AppConfigFile> {
+    const mtime = await this.fileMtimeMs();
+    if (!this.cache || mtime !== this.cacheMtimeMs) {
+      this.cache = await loadAppConfigFile(this.filePath);
+      this.cacheMtimeMs = await this.fileMtimeMs();
+    }
+    return this.cache;
+  }
+
+  private async persist(config: AppConfigFile): Promise<void> {
+    await saveAppConfigFile(this.filePath, config);
+    this.cache = config;
+    this.cacheMtimeMs = await this.fileMtimeMs();
+  }
+
   async ensureReady(): Promise<void> {
-    await loadAppConfigFile(this.filePath);
+    this.cache = await loadAppConfigFile(this.filePath);
+    this.cacheMtimeMs = await this.fileMtimeMs();
   }
 
   async snapshotConfig(): Promise<AppConfigFile> {
-    return loadAppConfigFile(this.filePath);
+    return clone(await this.loadCached());
   }
 
   async snapshotSettings(): Promise<AppSettings> {
@@ -111,45 +146,45 @@ export class JsonConfigStore implements AppConfigStore {
 
   async update(mutator: (state: RuntimeState) => Promise<void> | void): Promise<RuntimeState> {
     return this.withLock(async () => {
-      const config = await loadAppConfigFile(this.filePath);
+      const config = await this.loadCached();
       const next = clone(config);
       await mutator(next.runtime);
-      await saveAppConfigFile(this.filePath, next);
-      return next.runtime;
+      await this.persist(next);
+      return clone(next.runtime);
     });
   }
 
   async replace(next: RuntimeState): Promise<RuntimeState> {
     return this.withLock(async () => {
-      const config = await loadAppConfigFile(this.filePath);
+      const config = clone(await this.loadCached());
       config.runtime = next;
-      await saveAppConfigFile(this.filePath, config);
+      await this.persist(config);
       return next;
     });
   }
 
   async updateSettings(mutator: (settings: AppSettings) => Promise<void> | void): Promise<AppSettings> {
     return this.withLock(async () => {
-      const config = await loadAppConfigFile(this.filePath);
+      const config = await this.loadCached();
       const next = clone(config);
       await mutator(next.settings);
-      await saveAppConfigFile(this.filePath, next);
-      return next.settings;
+      await this.persist(next);
+      return clone(next.settings);
     });
   }
 
   async replaceSettings(next: AppSettings): Promise<AppSettings> {
     return this.withLock(async () => {
-      const config = await loadAppConfigFile(this.filePath);
+      const config = clone(await this.loadCached());
       config.settings = next;
-      await saveAppConfigFile(this.filePath, config);
+      await this.persist(config);
       return next;
     });
   }
 
   async replaceConfig(next: AppConfigFile): Promise<AppConfigFile> {
     return this.withLock(async () => {
-      await saveAppConfigFile(this.filePath, next);
+      await this.persist(next);
       return next;
     });
   }
