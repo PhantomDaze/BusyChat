@@ -7,6 +7,7 @@ import type {
   KnowledgeServiceApi,
   Logger,
   ModelAdminGateway,
+  PluginConfigStore,
   RuntimeStore,
 } from './types';
 
@@ -23,6 +24,10 @@ interface KnowledgeServiceDependencies {
     deleteKnowledgeEntry(id: string): Promise<string | false>;
   };
   models: ModelAdminGateway;
+  /** 知识库插件配置（存于插件 storage 命名空间） */
+  config: PluginConfigStore<KnowledgeBaseSettings>;
+  /** 插件在 config.json runtime.plugins 中的名称（用于判断启用状态） */
+  pluginName: string;
   appLogger: Logger;
 }
 
@@ -76,8 +81,14 @@ export class KnowledgeService implements KnowledgeServiceApi {
   }
 
   async status(): Promise<KnowledgeBaseSettings> {
+    const config = await this.deps.config.get();
+    return { ...config, enabled: await this.isEnabled() };
+  }
+
+  /** 知识库开关 = builtin-knowledge 插件是否启用 */
+  private async isEnabled(): Promise<boolean> {
     const runtime = await this.deps.runtime.snapshot();
-    return runtime.knowledgeBase;
+    return runtime.plugins[this.deps.pluginName]?.enabled !== false;
   }
 
   // -----------------------------------------------------------------------
@@ -88,11 +99,11 @@ export class KnowledgeService implements KnowledgeServiceApi {
     text: string,
     metadata: KnowledgeEntry['metadata'],
   ): Promise<KnowledgeEntry> {
-    const runtime = await this.deps.runtime.snapshot();
-    if (!runtime.knowledgeBase.enabled) {
+    if (!(await this.isEnabled())) {
       throw new Error('knowledge base is disabled');
     }
 
+    const config = await this.deps.config.get();
     const response = await this.deps.models.embed([text], {
       source: 'knowledge-add',
     });
@@ -104,10 +115,10 @@ export class KnowledgeService implements KnowledgeServiceApi {
     // Optional strict dimension check: a vector of the wrong width would be
     // stored but never match anything (cosineSimilarity returns 0 on length
     // mismatch), so fail loudly instead of persisting a dead entry.
-    const expectedDim = runtime.knowledgeBase.vectorDimension;
+    const expectedDim = config.vectorDimension;
     if (expectedDim && vector.length !== expectedDim) {
       throw new Error(
-        `embedding dimension mismatch: got ${vector.length}, expected ${expectedDim} (runtime.knowledgeBase.vectorDimension)`,
+        `embedding dimension mismatch: got ${vector.length}, expected ${expectedDim} (builtin-knowledge config)`,
       );
     }
 
@@ -143,8 +154,8 @@ export class KnowledgeService implements KnowledgeServiceApi {
       return [];
     }
 
-    const runtime = await this.deps.runtime.snapshot();
-    const maxResults = limit ?? runtime.knowledgeBase.maxResults;
+    const config = await this.deps.config.get();
+    const maxResults = limit ?? config.maxResults;
 
     // Step 1: Embed the query
     const response = await this.deps.models.embed([query], {

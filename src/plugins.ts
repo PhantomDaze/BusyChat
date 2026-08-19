@@ -8,6 +8,7 @@ import type {
   BotPlugin,
   CommandDefinition,
   JsonObject,
+  KnowledgeControl,
   KnowledgeGateway,
   Logger,
   JsonValue,
@@ -21,9 +22,14 @@ import type {
   PluginModule,
   PluginPermission,
   PluginRuntimeReader,
+  ReplyControl,
   RuntimeStore,
+  SummaryControl,
   SummaryRecord,
+  WebUiRouteHandler,
+  WebUiRouteRegistrar,
 } from './types';
+import { createPluginConfigStore } from './plugin-config';
 
 interface PluginManagerDependencies {
   runtime: RuntimeStore;
@@ -32,8 +38,15 @@ interface PluginManagerDependencies {
   storage: AppServices['storage'];
   commands: AppServices['commands'];
   knowledge: AppServices['knowledge'];
+  summaryControl?: SummaryControl;
+  replyControl?: ReplyControl;
+  knowledgeControl?: KnowledgeControl;
   appLogger: Logger;
   pluginSearchDirs: string[];
+}
+
+interface WebUiRouteEntry extends WebUiRouteHandler {
+  owner: string;
 }
 
 interface LoadedPlugin {
@@ -53,13 +66,16 @@ interface PluginEntrypointCandidate {
 interface PluginManagerApi {
   load(): Promise<void>;
   reload(): Promise<void>;
+  reloadOne(name: string): Promise<void>;
   shutdown(): Promise<void>;
   dispatchMessage(event: NormalizedMessageEvent): Promise<void>;
   dispatchSummary(summary: SummaryRecord): Promise<void>;
   dispatchAdvice(advice: AdviceRecord): Promise<void>;
-  list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined }>>;
+  list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined; filePath?: string }>>;
   setEnabled(name: string, enabled: boolean): Promise<void>;
   listLoadedManifestNames(): Promise<string[]>;
+  /** 插件注册的 WebUI 路由（供 WebUI 服务器挂载） */
+  collectWebUiRoutes(): Array<{ owner: string; route: WebUiRouteHandler }>;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -251,7 +267,7 @@ function wrapModels(models: ModelAdminGateway, permissions: Set<PluginPermission
 }
 
 function wrapKnowledge(
-  knowledge: AppServices['knowledge'],
+  knowledge: NonNullable<AppServices['knowledge']>,
   permissions: Set<PluginPermission>,
 ): KnowledgeGateway {
   return {
@@ -295,21 +311,25 @@ function createPluginContext(
   plugin: BotPlugin,
   base: PluginManagerDependencies,
   logger: Logger,
+  webUiRoutes: WebUiRouteEntry[],
+  manifestToRoutes: Map<string, WebUiRouteEntry[]>,
 ): PluginContext {
   const permissions = permissionSet(plugin.manifest);
   const storage = createNamespacedStorage(base.storage.namespace(plugin.manifest.name), permissions);
   const bot = wrapBot(base.bot, permissions);
   const models = wrapModels(base.models, permissions);
   const runtime = createReadOnlyRuntime(base.runtime);
+  // 插件自己的配置访问器：配置是插件元数据，不依赖 storage 权限声明
+  const config = createPluginConfigStore<JsonObject>(
+    base.storage.namespace(plugin.manifest.name),
+    {},
+  );
 
   const commands = {
     register(command: CommandDefinition): void {
       if (!permissions.has('command:register')) {
         throw new Error('plugin lacks command:register permission');
       }
-      // Force the owner to this plugin's name — never trust a caller-supplied
-      // owner, or a plugin could claim `builtin` and hijack a core command
-      // (which would then also survive this plugin's unregisterOwner).
       base.commands.register({
         ...command,
         owner: plugin.manifest.name,
@@ -319,8 +339,27 @@ function createPluginContext(
 
   const hasKnowledgeRead = permissions.has('knowledge:read');
   const hasKnowledgeWrite = permissions.has('knowledge:write');
-  const knowledge = hasKnowledgeRead || hasKnowledgeWrite
+  const knowledge = (hasKnowledgeRead || hasKnowledgeWrite) && base.knowledge
     ? wrapKnowledge(base.knowledge, permissions)
+    : undefined;
+
+  const summaryControl = permissions.has('summary:control') ? base.summaryControl : undefined;
+  const replyControl = permissions.has('reply:control') ? base.replyControl : undefined;
+  const knowledgeControl = permissions.has('knowledge:control') ? base.knowledgeControl : undefined;
+
+  const webui: WebUiRouteRegistrar | undefined = permissions.has('webui:route')
+    ? {
+        register(route: WebUiRouteHandler): void {
+          const entry: WebUiRouteEntry = { ...route, owner: plugin.manifest.name };
+          webUiRoutes.push(entry);
+          let list = manifestToRoutes.get(plugin.manifest.name);
+          if (!list) {
+            list = [];
+            manifestToRoutes.set(plugin.manifest.name, list);
+          }
+          list.push(entry);
+        },
+      }
     : undefined;
 
   return {
@@ -328,33 +367,79 @@ function createPluginContext(
     bot,
     models,
     storage,
+    config,
     commands,
     runtime,
     knowledge,
+    summaryControl,
+    replyControl,
+    knowledgeControl,
+    webui,
     logger,
   };
 }
 
 export class PluginManager implements PluginManagerApi {
   private readonly loaded = new Map<string, LoadedPlugin>();
+  private readonly webUiRoutes: WebUiRouteEntry[] = [];
+  private readonly manifestToRoutes = new Map<string, WebUiRouteEntry[]>();
+  private readonly builtins: BotPlugin[] = [];
+  private watcher: import('node:fs').FSWatcher | null = null;
+  private reloadTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly deps: PluginManagerDependencies) {}
 
+  /** 注册内置插件（不经过文件发现，在 load 之前调用） */
+  registerBuiltin(plugin: BotPlugin): void {
+    this.builtins.push(plugin);
+  }
+
   async load(): Promise<void> {
     await this.reload();
+    this.startWatching();
   }
 
   async reload(): Promise<void> {
     await this.shutdown();
 
-    const entrypoints = await discoverPluginEntrypoints(this.deps.pluginSearchDirs);
     const runtime = await this.deps.runtime.snapshot();
     const nextPlugins = { ...runtime.plugins };
 
+    // 先加载内置插件
+    for (const plugin of this.builtins) {
+      const name = plugin.manifest.name;
+      const pluginState =
+        nextPlugins[name] ?? (nextPlugins[name] = { enabled: true });
+      const logger = this.deps.appLogger.child(`plugin:${name}`);
+      const context = createPluginContext(plugin, this.deps, logger, this.webUiRoutes, this.manifestToRoutes);
+      const enabled = pluginState.enabled !== false;
+      if (enabled) {
+        try {
+          await plugin.setup(context);
+          logger.info('builtin plugin loaded', { version: plugin.manifest.version });
+        } catch (error) {
+          this.deps.commands.unregisterOwner(name);
+          this.removeRoutesForOwner(name);
+          this.deps.appLogger.error('failed to load builtin plugin', {
+            name,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      this.loaded.set(name, {
+        manifest: plugin.manifest,
+        plugin,
+        context,
+        filePath: '(builtin)',
+        enabled,
+      });
+    }
+
+    // 再加载文件系统发现的插件
+    const entrypoints = await discoverPluginEntrypoints(this.deps.pluginSearchDirs);
+
     for (const filePath of entrypoints) {
       try {
-        // Cache-bust the import so `reload()` picks up edited plugin source
-        // instead of returning the previously cached module object.
         const importUrl = `${pathToFileURL(filePath).href}?v=${Date.now()}`;
         const mod = (await dynamicImport(importUrl)) as PluginModule;
         const plugin = mod.createPlugin ? unwrapPluginCandidate(await mod.createPlugin()) : resolvePluginModule(mod);
@@ -371,21 +456,17 @@ export class PluginManager implements PluginManagerApi {
           nextPlugins[plugin.manifest.name] ??
           (nextPlugins[plugin.manifest.name] = {
             enabled: true,
-            config: {},
           });
         const logger = this.deps.appLogger.child(`plugin:${plugin.manifest.name}`);
-        const context = createPluginContext(plugin, this.deps, logger);
+        const context = createPluginContext(plugin, this.deps, logger, this.webUiRoutes, this.manifestToRoutes);
         const enabled = pluginState.enabled !== false;
 
         if (enabled) {
-          // Run setup BEFORE registering the plugin so a setup failure (e.g. a
-          // duplicate command name) doesn't leave a half-initialized plugin in
-          // `loaded` still receiving message hooks. Roll back any commands it
-          // managed to register before throwing.
           try {
             await plugin.setup(context);
           } catch (error) {
             this.deps.commands.unregisterOwner(plugin.manifest.name);
+            this.removeRoutesForOwner(plugin.manifest.name);
             throw error;
           }
           logger.info('plugin loaded', { version: plugin.manifest.version, filePath });
@@ -413,12 +494,160 @@ export class PluginManager implements PluginManagerApi {
     });
   }
 
+  async reloadOne(name: string): Promise<void> {
+    const record = this.loaded.get(name);
+    if (record) {
+      this.deps.commands.unregisterOwner(name);
+      this.removeRoutesForOwner(name);
+      const teardowns: Array<() => unknown> = [];
+      if (record.plugin.hooks?.onShutdown) {
+        teardowns.push(() => record.plugin.hooks!.onShutdown!(record.context));
+      }
+      if (record.plugin.teardown) {
+        teardowns.push(() => record.plugin.teardown!(record.context));
+      }
+      for (const run of teardowns) {
+        try {
+          await run();
+        } catch (error) {
+          this.deps.appLogger.warn('plugin teardown failed', {
+            plugin: name,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      this.loaded.delete(name);
+    }
+
+    const entrypoints = await discoverPluginEntrypoints(this.deps.pluginSearchDirs);
+    const targetEntry = entrypoints.find((filePath) => {
+      const segments = filePath.split(path.sep);
+      const dir = segments[segments.length - 2] ?? '';
+      return dir === name || filePath.includes(`${path.sep}${name}${path.sep}index.`);
+    });
+    if (!targetEntry) {
+      throw new Error(`plugin "${name}" not found in plugin search directories`);
+    }
+
+    const runtime = await this.deps.runtime.snapshot();
+    const pluginState = runtime.plugins[name] ?? { enabled: true };
+    const importUrl = `${pathToFileURL(targetEntry).href}?v=${Date.now()}`;
+    const mod = (await dynamicImport(importUrl)) as PluginModule;
+    const plugin = mod.createPlugin ? unwrapPluginCandidate(await mod.createPlugin()) : resolvePluginModule(mod);
+    if (!plugin) {
+      throw new Error(`plugin module "${name}" did not export a plugin`);
+    }
+    if (!plugin.manifest?.name) {
+      throw new Error('plugin manifest.name is required');
+    }
+    const logger = this.deps.appLogger.child(`plugin:${plugin.manifest.name}`);
+    const context = createPluginContext(plugin, this.deps, logger, this.webUiRoutes, this.manifestToRoutes);
+    const enabled = pluginState.enabled !== false;
+    if (enabled) {
+      try {
+        await plugin.setup(context);
+      } catch (error) {
+        this.deps.commands.unregisterOwner(plugin.manifest.name);
+        this.removeRoutesForOwner(plugin.manifest.name);
+        throw error;
+      }
+      logger.info('plugin reloaded', { version: plugin.manifest.version, filePath: targetEntry });
+    }
+    this.loaded.set(plugin.manifest.name, {
+      manifest: plugin.manifest,
+      plugin,
+      context,
+      filePath: targetEntry,
+      enabled,
+    });
+  }
+
+  private removeRoutesForOwner(name: string): void {
+    const routes = this.manifestToRoutes.get(name);
+    if (!routes) return;
+    for (const r of routes) {
+      const idx = this.webUiRoutes.indexOf(r);
+      if (idx >= 0) this.webUiRoutes.splice(idx, 1);
+    }
+    this.manifestToRoutes.delete(name);
+  }
+
+  collectWebUiRoutes(): Array<{ owner: string; route: WebUiRouteHandler }> {
+    return this.webUiRoutes.map((entry) => ({ owner: entry.owner, route: { ...entry, owner: undefined } as WebUiRouteHandler }));
+  }
+
+  private startWatching(): void {
+    if (this.watcher) return;
+    const fs = require('node:fs') as typeof import('node:fs');
+    const watchedDirs = new Set<string>();
+    for (const dir of this.deps.pluginSearchDirs) {
+      watchedDirs.add(path.resolve(process.cwd(), dir));
+    }
+    const onChange = (): void => {
+      if (this.reloadTimer) return;
+      this.reloadTimer = setTimeout(() => {
+        this.reloadTimer = null;
+        void this.reload().catch((error) => {
+          this.deps.appLogger.warn('auto-reload from file watcher failed', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }, 300);
+    };
+    const watchers: import('node:fs').FSWatcher[] = [];
+    try {
+      for (const dir of watchedDirs) {
+        const w = fs.watch(
+          dir,
+          { recursive: true },
+          (event: string, filename: string | Buffer | null) => {
+            if (!filename) return;
+            const name = typeof filename === 'string' ? filename : filename.toString();
+            if (!/\.(ts|tsx|js|cjs|mjs)$/.test(name)) return;
+            this.deps.appLogger.info('plugin source changed, reloading', { filename: name });
+            onChange();
+          },
+        );
+        watchers.push(w);
+      }
+      // 用第一个 watcher 作为主引用，其余存入数组统一关闭
+      this.watcher = watchers[0] ?? null;
+      if (watchers.length > 1) {
+        this.extraWatchers = watchers.slice(1);
+      }
+      for (const w of watchers) {
+        w.on('error', () => {
+          // 单个 watcher 出错不影响其他
+        });
+      }
+    } catch {
+      this.watcher = null;
+      this.extraWatchers = [];
+    }
+  }
+
+  private extraWatchers: import('node:fs').FSWatcher[] = [];
+
+  private stopWatching(): void {
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+    for (const w of this.extraWatchers) {
+      w.close();
+    }
+    this.extraWatchers = [];
+    if (this.reloadTimer) {
+      clearTimeout(this.reloadTimer);
+      this.reloadTimer = null;
+    }
+  }
+
   async shutdown(): Promise<void> {
+    this.stopWatching();
     for (const [name, record] of this.loaded.entries()) {
       this.deps.commands.unregisterOwner(name);
-      // Both teardown() and hooks.onShutdown() are teardown surfaces; a plugin
-      // may use either. Auto-memory clears its daily timer in onShutdown, so
-      // skipping it would leak the interval past disable/reload/app-stop.
+      this.removeRoutesForOwner(name);
       const teardowns: Array<() => unknown> = [];
       if (record.plugin.hooks?.onShutdown) {
         teardowns.push(() => record.plugin.hooks!.onShutdown!(record.context));
@@ -438,6 +667,8 @@ export class PluginManager implements PluginManagerApi {
       }
     }
     this.loaded.clear();
+    this.webUiRoutes.length = 0;
+    this.manifestToRoutes.clear();
   }
 
   async dispatchMessage(event: NormalizedMessageEvent): Promise<void> {
@@ -526,7 +757,7 @@ export class PluginManager implements PluginManagerApi {
     await Promise.all(tasks);
   }
 
-  async list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined }>> {
+  async list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined; filePath?: string }>> {
     const runtime = await this.deps.runtime.snapshot();
     return [...this.loaded.values()]
       .map((record) => ({
@@ -534,6 +765,7 @@ export class PluginManager implements PluginManagerApi {
         version: record.manifest.version,
         enabled: runtime.plugins[record.manifest.name]?.enabled !== false && record.enabled,
         description: record.manifest.description,
+        filePath: record.filePath,
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -543,7 +775,6 @@ export class PluginManager implements PluginManagerApi {
       if (!state.plugins[name]) {
         state.plugins[name] = {
           enabled,
-          config: {},
         };
       } else {
         state.plugins[name].enabled = enabled;

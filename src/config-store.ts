@@ -130,6 +130,14 @@ export class JsonConfigStore implements AppConfigStore {
     this.cacheMtimeMs = await this.fileMtimeMs();
   }
 
+  /**
+   * 读取磁盘上的原始配置（不经过 normalize），用于迁移旧版字段等一次性操作。
+   * 注意：normalize 会把已废弃的 runtime 业务字段丢弃，迁移必须从原始文件取。
+   */
+  async readRawConfig(): Promise<Partial<AppConfigFile> | undefined> {
+    return readJsonFile<Partial<AppConfigFile>>(this.filePath);
+  }
+
   async snapshotConfig(): Promise<AppConfigFile> {
     return clone(await this.loadCached());
   }

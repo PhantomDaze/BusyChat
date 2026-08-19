@@ -12,8 +12,8 @@ OneBot v11 AI assistant framework for QQ. Filters noise from group chats, summar
 - **Daily memory** (plugin) — auto-summarizes the day's activity at 21:30 Beijing time and writes it into the knowledge base. Also extracts facts, decisions, and action items.
 - **Knowledge base** — semantic search over stored memories using embeddings + cosine similarity + reranking.
 - **Keyword alerts & quiet hours** — instant admin notification for keyword matches; configurable do-not-disturb window.
-- **Plugin system** — permissioned, hot-reloadable plugins with access to bot APIs, model calls, storage, and knowledge base.
-- **WebUI** — dashboard, model management, plugin toggle, WebSocket control, message log viewer, config editor, and password-protected login page.
+- **Everything is a plugin** — summary, knowledge base, reply assistant, admin commands, and keyword alerts are all plugins built on the same interface as third-party plugins. Plugins are permissioned and hot-reloadable (file-watch + WebUI reload button), and can register their own WebUI routes and settings panels.
+- **WebUI** — light/dark/system theme, dashboard, model management (add / edit / delete / task binding), plugin toggles, knowledge base search, OneBot & WebSocket connection settings, summary controls, keyword alerts & quiet hours, reply queue management, message log viewer, config editor, and password-protected login.
 - **Long-message chunking** — auto-splits messages that exceed QQ's character limit, splitting at paragraph / sentence boundaries.
 
 ## Quick Start
@@ -34,7 +34,7 @@ npm run typecheck          # TypeScript type check
 npm run test:ws            # WebSocket forward & reverse (18 tests)
 npm run test:kb            # Knowledge base (14 tests)
 npm run test:cmd           # Command permissions (3 tests)
-npm run test:logic         # Chunking, storage durability, reply routing (12 tests)
+npm run test:logic         # Chunking, storage durability, reply routing (17 tests)
 npm run test:webui         # WebUI auth/session/redaction against a live server (19 tests)
 npm run test:all           # All of the above
 ```
@@ -42,6 +42,16 @@ npm run test:all           # All of the above
 Set `LOG_LEVEL=debug|info|warn|error|silent` to control log verbosity (default `info`).
 
 ## Configuration
+
+`config.json` holds only **kernel configuration** (`settings`, `admins`, `onebot`, `models`, `activeModels`, `plugins` enabled state, `ui`). Builtin plugins keep their **business configuration in their own plugin storage namespace** (the `config` key in the DB `plugin_kv` table, surfaced as `data/plugins/<name>.json`), edited via the WebUI panel or the plugin's commands:
+
+| Plugin | Business config | Storage | WebUI panel |
+|---|---|---|---|
+| `builtin-summary` | enabled, interval, batch size, max events/prompt | `data/plugins/builtin-summary.json` | Summary |
+| `builtin-knowledge` | enabled, max results, vector dimension | `data/plugins/builtin-knowledge.json` | Knowledge base |
+| `builtin-notify` | keywords, quiet hours | `data/plugins/builtin-notify.json` | Alerts |
+
+On upgrade from an older version, leftover `runtime.summary` / `runtime.knowledgeBase` / `runtime.notifyKeywords` / `runtime.quietHours` are **automatically migrated** into the matching plugin storage on first boot (idempotent — `config.json` is rewritten clean afterwards). The knowledge base on/off switch is the `builtin-knowledge` plugin enabled state (legacy `knowledgeBase.enabled=false` → plugin disabled).
 
 ### WebSocket
 

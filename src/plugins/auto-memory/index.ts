@@ -400,7 +400,8 @@ async function runDailySummaryInner(ctx: PluginContext): Promise<void> {
   const state = await readState(ctx);
   const runtime = await ctx.runtime.snapshot();
 
-  if (!runtime.knowledgeBase.enabled) {
+  // 知识库开关 = builtin-knowledge 插件是否启用
+  if (runtime.plugins['builtin-knowledge']?.enabled === false) {
     ctx.logger.warn('auto-memory: knowledge base disabled, skipping summary');
     return;
   }

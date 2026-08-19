@@ -112,8 +112,8 @@ interface WebServerDependencies {
   runtime: AppServices['runtime'];
   models: AppServices['models'];
   plugins: AppServices['plugins'];
-  summaries: AppServices['summaries'];
-  knowledge: AppServices['knowledge'];
+  summaries?: AppServices['summaries'];
+  knowledge?: AppServices['knowledge'];
   storage: AppServices['storage'];
   oneBotWebSocket?: {
     restart(): Promise<void>;
@@ -529,7 +529,8 @@ async function getState(deps: WebServerDependencies) {
     deps.storage.listEventsAfter(undefined, 25),
     deps.storage.countKnowledgeEntries(),
   ]);
-  const summaryStatus = await deps.summaries.status();
+  const summaryStatus = deps.summaries ? await deps.summaries.status() : undefined;
+  const knowledgeStatus = deps.knowledge ? await deps.knowledge.status() : undefined;
   const fallbackOnly = await deps.models.hasOnlyFallbackModels();
 
   const safeConfig = redactConfig(config);
@@ -823,64 +824,15 @@ export async function createWebServer(deps: WebServerDependencies): Promise<Hapi
         // otherwise every save would wipe the password and all API keys.
         const current = await deps.config.snapshotConfig();
         const warnings = restoreSecrets(normalized, current);
-        // The summary cursor is runtime bookkeeping, not operator config: the
-        // editor's snapshot is stale by the time it is saved, and writing the
-        // old cursor back would re-summarize already-reported events.
-        const liveCursor = current.runtime?.summary;
-        if (liveCursor?.cursorEventId) {
-          normalized.runtime.summary.cursorEventId = liveCursor.cursorEventId;
-        }
-        if (liveCursor?.lastGeneratedAt) {
-          normalized.runtime.summary.lastGeneratedAt = liveCursor.lastGeneratedAt;
-        }
         await deps.config.replaceConfig(normalized);
-        await deps.summaries.start();
+        if (deps.summaries) await deps.summaries.start();
         if (deps.oneBotWebSocket) {
           await deps.oneBotWebSocket.restart();
         }
         return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
       },
     },
-    {
-      method: 'POST',
-      path: '/api/summary/settings',
-      handler: async (request, h) => {
-        const runtime = await deps.runtime.snapshot();
-        if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
-          return h.response({ error: 'unauthorized' }).code(401);
-        }
-        const payload = request.payload as JsonObject | undefined;
-        await deps.runtime.update((state) => {
-          const enabled = typeof payload?.enabled === 'boolean' ? payload.enabled : state.summary.enabled;
-          // Clamp to sane bounds so a bad value can't spin setInterval(fn, 0)
-          // into a CPU/disk/API-spend hot loop.
-          const intervalMs = typeof payload?.intervalMs === 'number'
-            ? clampInt(payload.intervalMs, 5_000, 24 * 60 * 60 * 1000)
-            : state.summary.intervalMs;
-          const batchSize = typeof payload?.batchSize === 'number'
-            ? clampInt(payload.batchSize, 1, 1000)
-            : state.summary.batchSize;
-          const maxEventsPerPrompt = typeof payload?.maxEventsPerPrompt === 'number'
-            ? clampInt(payload.maxEventsPerPrompt, 1, 500)
-            : state.summary.maxEventsPerPrompt;
-          state.summary = { ...state.summary, enabled, intervalMs, batchSize, maxEventsPerPrompt };
-        });
-        await deps.summaries.start();
-        return { ok: true };
-      },
-    },
-    {
-      method: 'POST',
-      path: '/api/summary/flush',
-      handler: async (request, h) => {
-        const runtime = await deps.runtime.snapshot();
-        if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
-          return h.response({ error: 'unauthorized' }).code(401);
-        }
-        const record = await deps.summaries.flush('manual');
-        return record ? record : { ok: true, empty: true };
-      },
-    },
+
     {
       method: 'POST',
       path: '/api/admins',
@@ -1054,85 +1006,8 @@ export async function createWebServer(deps: WebServerDependencies): Promise<Hapi
     },
 
     // Knowledge base
-    {
-      method: 'GET',
-      path: '/api/knowledge',
-      handler: async (request, h) => {
-        const runtime = await deps.runtime.snapshot();
-        if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
-          return h.response({ error: 'unauthorized' }).code(401);
-        }
-        const limit = typeof request.query.limit === 'string'
-          ? parseInt(request.query.limit, 10) || undefined
-          : undefined;
-        return deps.knowledge.list(limit);
-      },
-    },
-    {
-      method: 'POST',
-      path: '/api/knowledge',
-      handler: async (request, h) => {
-        const runtime = await deps.runtime.snapshot();
-        if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
-          return h.response({ error: 'unauthorized' }).code(401);
-        }
-        const payload = request.payload as JsonObject | undefined;
-        const text = typeof payload?.text === 'string' ? payload.text.trim() : '';
-        if (!text) {
-          return h.response({ error: 'text is required' }).code(400);
-        }
-        const entry = await deps.knowledge.add(text, { source: 'webui', type: 'user' });
-        return entry;
-      },
-    },
-    {
-      method: 'DELETE',
-      path: '/api/knowledge/{id}',
-      handler: async (request, h) => {
-        const runtime = await deps.runtime.snapshot();
-        if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
-          return h.response({ error: 'unauthorized' }).code(401);
-        }
-        const deleted = await deps.knowledge.delete(String(request.params.id));
-        return { deleted };
-      },
-    },
-    {
-      method: 'POST',
-      path: '/api/knowledge/search',
-      handler: async (request, h) => {
-        const runtime = await deps.runtime.snapshot();
-        if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
-          return h.response({ error: 'unauthorized' }).code(401);
-        }
-        const payload = request.payload as JsonObject | undefined;
-        const query = typeof payload?.query === 'string' ? payload.query.trim() : '';
-        if (!query) {
-          return h.response({ error: 'query is required' }).code(400);
-        }
-        const limit = typeof payload?.limit === 'number' ? payload.limit : undefined;
-        return deps.knowledge.search(query, limit);
-      },
-    },
-    {
-      method: 'POST',
-      path: '/api/knowledge/summarize',
-      handler: async (request, h) => {
-        const runtime = await deps.runtime.snapshot();
-        if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
-          return h.response({ error: 'unauthorized' }).code(401);
-        }
-        const payload = request.payload as JsonObject | undefined;
-        const entryIds = Array.isArray(payload?.entryIds)
-          ? (payload!.entryIds as unknown[]).map(String)
-          : undefined;
-        const result = await deps.knowledge.summarize(entryIds);
-        if (!result) {
-          return h.response({ error: 'no entries to summarize' }).code(404);
-        }
-        return result;
-      },
-    },
+    // Knowledge base routes are now provided by the builtin knowledge plugin
+    // via collectWebUiRoutes() and mounted below.
     {
       method: 'POST',
       path: '/api/ws-config',
@@ -1198,6 +1073,44 @@ export async function createWebServer(deps: WebServerDependencies): Promise<Hapi
       },
     },
   ]);
+
+  // 挂载插件注册的 WebUI 路由
+  for (const entry of deps.plugins.collectWebUiRoutes()) {
+    const route = entry.route;
+    server.route([
+      {
+        method: route.method,
+        path: route.path,
+        handler: async (request, h) => {
+          if (route.requireAuth !== false) {
+            const runtime = await deps.runtime.snapshot();
+            if (!requireUiAuth(request, sessions, runtime.ui.password, runtime.ui.authToken)) {
+              return h.response({ error: 'unauthorized' }).code(401);
+            }
+          }
+          const query: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(request.query as Record<string, unknown>)) {
+            query[k] = v;
+          }
+          // 路径参数注入到 query 里，方便插件处理
+          const params = request.params as Record<string, unknown>;
+          if (params) {
+            for (const [k, v] of Object.entries(params)) {
+              query[k] = v;
+            }
+          }
+          try {
+            const result = await route.handler(request.payload as JsonObject | undefined, query);
+            return result;
+          } catch (error) {
+            return h
+              .response({ error: error instanceof Error ? error.message : String(error) })
+              .code(400);
+          }
+        },
+      },
+    ]);
+  }
 
   // Loud warning if the dashboard is reachable off-host with no password: the
   // default config ships without one, which disables auth entirely.

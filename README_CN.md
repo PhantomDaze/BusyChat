@@ -33,7 +33,7 @@ npm run test:kb
 # 命令权限测试（3 项）
 npm run test:cmd
 
-# 分片/存储持久化/回复路由测试（12 项）
+# 分片/存储持久化/回复路由测试（17 项）
 npm run test:logic
 
 # WebUI 认证/会话/脱敏测试（19 项，启动真实服务器）
@@ -44,6 +44,41 @@ npm run test:all
 ```
 
 可通过环境变量 `LOG_LEVEL=debug|info|warn|error|silent` 控制日志级别（默认 `info`）。
+
+## WebUI 仪表盘
+
+启动后访问 `http://<host>:<port>/ui` 进入 WebUI（未设密码时任何能访问该地址的人都可以完全控制机器人，建议在「管理员」页立即设置密码）。
+
+WebUI 提供以下页面（所有 runtime 配置项均可即时生效，无需重启）：
+
+| 页面 | 功能 |
+|---|---|
+| 仪表盘 | 运行概览、最近消息、最近摘要 |
+| 模型 | 任务绑定、启停、**添加/编辑/删除模型**（表单可视化配置，API Key 脱敏显示） |
+| 插件 | 启停插件、全部重载 |
+| 知识库 | 语义搜索、添加/删除条目 |
+| 管理员 | 添加/移除管理员、设置管理密码 |
+| OneBot | HTTP API 地址、前缀、Access Token、自身 QQ 号、超时 |
+| WS | WebSocket 模式/地址/重连/超时，实时状态 |
+| 摘要 | 开关、间隔、触发条数、单次最大事件、立即生成 |
+| 告警 | 关键词列表增删、免打扰时段 |
+| 回复 | 待回复队列、AI 生成回复、忽略 |
+| 日志 | 消息日志（按范围/发送者过滤） |
+| 配置 | 直接编辑 config.json（脱敏） |
+
+界面支持浅色 / 深色 / 跟随系统三种主题（侧边栏底部切换，存 localStorage）。
+
+## 配置文件与插件配置
+
+`config.json` 只保留**内核配置**（`settings`、`admins`、`onebot`、`models`、`activeModels`、`plugins` 启用状态、`ui`）。各内置插件的**业务配置不占用 config.json 的字段**，而是存放在插件自己的 storage 命名空间（数据库 `plugin_kv` 表的 `config` 键，文件形态见 `data/plugins/<name>.json`），由 WebUI 对应页面或插件命令修改：
+
+| 插件 | 业务配置 | 存储位置 | WebUI 页面 |
+|---|---|---|---|
+| `builtin-summary` | 开关、间隔、触发条数、单次最大事件 | `data/plugins/builtin-summary.json` | 摘要 |
+| `builtin-knowledge` | 开关、最大结果数、向量维度 | `data/plugins/builtin-knowledge.json` | 知识库 |
+| `builtin-notify` | 关键词、免打扰时段 | `data/plugins/builtin-notify.json` | 告警 |
+
+从旧版本升级时，`config.json` 中遗留的 `runtime.summary` / `runtime.knowledgeBase` / `runtime.notifyKeywords` / `runtime.quietHours` 会在首次启动时**自动迁移**到对应插件的存储（幂等：迁移完成后 config.json 会被重写为干净形态）。知识库开关对应 `builtin-knowledge` 插件的启用状态（旧 `knowledgeBase.enabled=false` → 插件禁用）。
 
 ## 配置 WebSocket
 

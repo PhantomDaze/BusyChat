@@ -1,7 +1,6 @@
 import type {
   AppConfigFile,
   AppSettings,
-  KnowledgeBaseSettings,
   ModelConfig,
   ModelFamily,
   ModelTask,
@@ -10,7 +9,6 @@ import type {
   OneBotWebSocketMode,
   PluginRuntimeState,
   RuntimeState,
-  SummarySettings,
   UiSettings,
 } from './types';
 
@@ -142,29 +140,11 @@ function createDefaultActiveModels(): Partial<Record<ModelTask, string>> {
   };
 }
 
-export function createDefaultSummarySettings(): SummarySettings {
-  return {
-    enabled: true,
-    intervalMs: 120_000,
-    batchSize: 5,
-    maxEventsPerPrompt: 40,
-  };
-}
-
 export function createDefaultUiSettings(): UiSettings {
   return {
     enabled: true,
     title: 'F261Agent',
     password: '',
-  };
-}
-
-export function createDefaultKnowledgeBaseSettings(): KnowledgeBaseSettings {
-  return {
-    enabled: true,
-    maxResults: 10,
-    // No default vectorDimension: the actual width is decided by the embedding
-    // model. Set it explicitly only if you want strict dimension validation.
   };
 }
 
@@ -186,13 +166,10 @@ export function createDefaultRuntimeState(): RuntimeState {
   return {
     admins: [],
     onebot: createDefaultOneBotSettings(),
-    summary: createDefaultSummarySettings(),
-    knowledgeBase: createDefaultKnowledgeBaseSettings(),
     activeModels: createDefaultActiveModels(),
     models: createDefaultModels(),
     plugins: {},
     ui: createDefaultUiSettings(),
-    notifyKeywords: [],
   };
 }
 
@@ -229,9 +206,8 @@ function mergePluginStates(
     if (name.startsWith('_') || !isPlainObject(state)) continue;
     merged[name] = {
       // Absent `enabled` means enabled — an operator hand-adding a plugin's
-      // config block should not silently disable the plugin.
+      // entry should not silently disable the plugin.
       enabled: state.enabled !== false,
-      config: { ...(state.config ?? {}) },
     };
   }
   return merged;
@@ -327,56 +303,6 @@ export function normalizeRuntimeState(persisted?: Partial<RuntimeState>): Runtim
     onebot.selfId = selfId;
   }
 
-  const summary: SummarySettings = {
-    ...defaults.summary,
-  };
-  const persistedSummary = persisted.summary;
-  const summaryEnabled = toBoolean(persistedSummary?.enabled);
-  if (typeof summaryEnabled === 'boolean') {
-    summary.enabled = summaryEnabled;
-  }
-  // Clamp at the normalization layer so EVERY write path is covered — the
-  // WebUI config editor posts raw JSON that bypasses per-route validation,
-  // and an unclamped intervalMs of 1 becomes a setInterval hot loop that
-  // burns CPU and model credit.
-  const summaryInterval = toPositiveInteger(persistedSummary?.intervalMs);
-  if (summaryInterval) {
-    summary.intervalMs = Math.min(Math.max(summaryInterval, 5_000), 24 * 60 * 60 * 1000);
-  }
-  const summaryBatchSize = toPositiveInteger(persistedSummary?.batchSize);
-  if (summaryBatchSize) {
-    summary.batchSize = Math.min(summaryBatchSize, 1000);
-  }
-  const summaryWindow = toPositiveInteger(persistedSummary?.maxEventsPerPrompt);
-  if (summaryWindow) {
-    summary.maxEventsPerPrompt = Math.min(summaryWindow, 500);
-  }
-  const cursorEventId = toTrimmedString(persistedSummary?.cursorEventId);
-  if (cursorEventId) {
-    summary.cursorEventId = cursorEventId;
-  }
-  const lastGeneratedAt = toTrimmedString(persistedSummary?.lastGeneratedAt);
-  if (lastGeneratedAt) {
-    summary.lastGeneratedAt = lastGeneratedAt;
-  }
-
-  const knowledgeBase: KnowledgeBaseSettings = {
-    ...defaults.knowledgeBase,
-  };
-  const persistedKb = persisted.knowledgeBase;
-  const kbEnabled = toBoolean(persistedKb?.enabled);
-  if (typeof kbEnabled === 'boolean') {
-    knowledgeBase.enabled = kbEnabled;
-  }
-  const kbMaxResults = toPositiveInteger(persistedKb?.maxResults);
-  if (kbMaxResults) {
-    knowledgeBase.maxResults = kbMaxResults;
-  }
-  const kbVectorDimension = toPositiveInteger(persistedKb?.vectorDimension);
-  if (kbVectorDimension) {
-    knowledgeBase.vectorDimension = kbVectorDimension;
-  }
-
   const ui: UiSettings = {
     ...defaults.ui,
   };
@@ -419,29 +345,13 @@ export function normalizeRuntimeState(persisted?: Partial<RuntimeState>): Runtim
     ? persisted.admins.map((id) => String(id).trim()).filter(Boolean)
     : [...defaults.admins];
 
-  const notifyKeywords = Array.isArray(persisted.notifyKeywords)
-    ? persisted.notifyKeywords.map((k) => String(k).trim()).filter(Boolean)
-    : [...defaults.notifyKeywords];
-
-  let quietHours: RuntimeState['quietHours'] = undefined;
-  if (persisted.quietHours && typeof persisted.quietHours.start === 'string' && typeof persisted.quietHours.end === 'string') {
-    quietHours = {
-      start: String(persisted.quietHours.start).trim(),
-      end: String(persisted.quietHours.end).trim(),
-    };
-  }
-
   return {
     admins,
     onebot,
-    summary,
-    knowledgeBase,
     activeModels,
     models,
     plugins,
     ui,
-    notifyKeywords,
-    ...(quietHours ? { quietHours } : {}),
   };
 }
 

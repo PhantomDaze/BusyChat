@@ -13,12 +13,15 @@ import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { KnowledgeService } from '../src/knowledge';
+import { createPluginConfigStore } from '../src/plugin-config';
 import { FileStore } from '../src/storage';
 import type {
+  KnowledgeBaseSettings,
   KnowledgeEntry,
   KnowledgeQueryResult,
   Logger,
   ModelAdminGateway,
+  PluginConfigStore,
   RuntimeStore,
   RuntimeState,
   EmbeddingResponse,
@@ -97,8 +100,6 @@ function createMockRuntimeStore(): RuntimeStore {
         actionTimeoutMs: 3000,
       },
     },
-    summary: { enabled: false, intervalMs: 120000, batchSize: 20, maxEventsPerPrompt: 40 },
-    knowledgeBase: { enabled: true, maxResults: 10, vectorDimension: 8 },
     activeModels: {
       'memory-summary': 'language-fallback',
       embedding: 'embedding-fallback',
@@ -191,6 +192,16 @@ function createMockLogger(name: string): Logger {
   };
 }
 
+/** 构造基于测试 store 的插件配置访问器（config 键），默认值与内置插件一致 */
+function createMockKnowledgeConfig(
+  store: FileStore,
+): PluginConfigStore<KnowledgeBaseSettings> {
+  return createPluginConfigStore<KnowledgeBaseSettings>(
+    store.namespace('test-knowledge-config'),
+    { enabled: true, maxResults: 10, vectorDimension: 8 },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Test setup / teardown
 // ---------------------------------------------------------------------------
@@ -246,6 +257,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -265,6 +278,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -288,6 +303,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -313,6 +330,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -340,6 +359,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -356,6 +377,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -376,6 +399,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -392,6 +417,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -420,6 +447,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -443,6 +472,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -459,6 +490,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {
@@ -485,6 +518,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     };
 
@@ -514,6 +549,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     };
 
@@ -548,6 +585,8 @@ async function main(): Promise<void> {
       runtime: createMockRuntimeStore(),
       storage: store,
       models: createMockModels(),
+      config: createMockKnowledgeConfig(store),
+      pluginName: 'builtin-knowledge',
       appLogger: createMockLogger('test'),
     });
     try {

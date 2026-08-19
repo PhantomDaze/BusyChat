@@ -11,6 +11,17 @@ That choice keeps the first version simple while preserving future options:
 - replace model providers independently of plugins
 - move the WebUI to a separate process later if needed
 
+## Everything is a plugin
+
+The application kernel only keeps transport, storage, config, the model registry, the command bus, the plugin manager, and the WebUI server. Every business feature is a plugin with the same lifecycle as a third-party one:
+
+- `builtin-knowledge` — knowledge base service + commands + WebUI routes
+- `builtin-reply` — pending-reply manager + commands + WebUI routes
+- `builtin-summary` — summary worker + core commands + WebUI routes
+- `builtin-notify` — keyword alerts & quiet hours + commands + WebUI routes
+
+Built-in and third-party plugins share the same `BotPlugin` interface, are discovered through the same plugin search dirs, and are all hot-reloadable (shutdown → re-discover → `import()` with cache-busting → setup, plus file-watch auto-reload). Plugins can extend the WebUI by registering API routes via `ctx.webui.register()` (permission `webui:route`).
+
 ## Core boundaries
 
 ### Transport
@@ -59,12 +70,14 @@ Infrastructure provides concrete implementations:
 
 ### Configuration
 
-The root-level `config.json` is the source of truth for both bootstrap settings and runtime state.
+The root-level `config.json` holds only **kernel configuration**. Plugin business config is deliberately kept out of it.
 
 - `settings` contains process-level inputs such as host, port, data directory, UI path, event path, and plugin search paths.
-- `runtime` contains mutable operational data such as admins, report recipients, OneBot HTTP/WebSocket credentials, summary settings, model registry entries, plugin runtime state, and UI settings.
+- `runtime` contains mutable kernel data only: admins, OneBot HTTP/WebSocket credentials, model registry entries, `activeModels` task bindings, plugin **enabled states**, and UI settings.
+- Each plugin keeps its own business configuration in its storage namespace under the `config` key (DB `plugin_kv` table, surfaced as `data/plugins/<name>.json`), read and written through `PluginContext.config` (`PluginConfigStore`). This is what makes "everything is a plugin, all hot-reloadable" coherent: `config.json` has almost nothing plugin-specific left in it.
 - `config.example.json` is the template used to create or reset the root config file.
-- The WebUI edits the same `config.json` file directly, but any `settings.*` change that affects the running server still requires restart.
+- The WebUI edits the same `config.json` for kernel settings; plugin settings are edited through the per-plugin WebUI routes, which persist into the plugin namespaces.
+- Legacy migration: on first boot after an upgrade, `runtime.summary` / `runtime.knowledgeBase` / `runtime.notifyKeywords` / `runtime.quietHours` are copied into the matching plugin namespaces, the knowledge-base on/off switch becomes the `builtin-knowledge` plugin enabled state, and `config.json` is rewritten clean (idempotent — a crash before the rewrite just re-runs the migration next boot).
 
 OneBot transport supports three inbound paths:
 

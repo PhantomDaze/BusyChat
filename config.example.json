@@ -5,7 +5,7 @@
     "_comment": "进程级启动参数，修改后需重启应用。",
 
     "dataDir": "data",
-    "_dataDir": "数据存储目录。默认 data/，含 f261agent.db（SQLite 数据库）。",
+    "_dataDir": "数据存储目录。默认 data/，含 f261agent.db（SQLite 数据库，事件/摘要/知识库/插件配置都在其中）。",
 
     "host": "127.0.0.1",
     "_host": "WebUI 和 OneBot 事件接收的监听地址。0.0.0.0 允许外部访问。",
@@ -14,7 +14,7 @@
     "_port": "监听端口。",
 
     "pluginSearchDirs": ["dist/plugins", "src/plugins"],
-    "_pluginSearchDirs": "插件搜索目录，按优先级排列。开发时 src/plugins 优先，生产用 dist/plugins。",
+    "_pluginSearchDirs": "第三方插件搜索目录，按优先级排列。内置插件由内核直接注册，不通过此处发现。开发时 src/plugins 优先，生产用 dist/plugins。",
 
     "uiPath": "/ui",
     "_uiPath": "WebUI 仪表盘的访问路径。",
@@ -24,16 +24,10 @@
   },
 
   "runtime": {
-    "_comment": "运行时配置，可通过 WebUI 热修改，无需重启。",
+    "_comment": "内核运行时配置，可通过 WebUI 热修改，无需重启。注意：本文件只保留内核配置。内置插件（summary / knowledge / notify / reply / commands）的业务配置存放在插件自己的 storage 命名空间（数据库 plugin_kv 表的 config 键，亦见 data/plugins/*.json），通过 WebUI 各插件页或各插件命令修改，不出现在这里。从旧版升级时，历史 runtime.summary / runtime.knowledgeBase / runtime.notifyKeywords / runtime.quietHours 会被自动迁移到对应插件存储，本文件会重写为干净形态。",
 
     "admins": ["10001", "10002"],
     "_admins": "管理员 QQ 号列表。管理员可使用所有命令，也是摘要报告的唯一接收者。",
-
-    "notifyKeywords": [],
-    "_notifyKeywords": "关键词告警列表。消息含关键词时立即私聊通知管理员（免打扰时段除外）。例如 [\"紧急\", \"报警\"]。",
-
-    "quietHours": null,
-    "_quietHours": "免打扰时段（可选）。格式: { \"start\": \"23:00\", \"end\": \"07:00\" }。时段内普通消息不推送给管理员，关键词告警仍然生效。不设置则 24 小时通知。",
 
     "onebot": {
       "_comment": "OneBot v11 协议连接配置。",
@@ -71,34 +65,6 @@
         "actionTimeoutMs": 10000,
         "_actionTimeoutMs": "WebSocket API 调用的超时（毫秒）。"
       }
-    },
-
-    "summary": {
-      "_comment": "消息摘要定时任务配置。",
-
-      "enabled": true,
-      "_enabled": "是否启用定时消息摘要。",
-
-      "intervalMs": 120000,
-      "_intervalMs": "摘要生成间隔（毫秒），默认 120000 = 2 分钟。",
-
-      "batchSize": 5,
-      "_batchSize": "触发自动摘要所需的最小新消息数。手动触发不受此限制。",
-
-      "maxEventsPerPrompt": 40,
-      "_maxEventsPerPrompt": "每次 LLM 调用包含的最多事件数，超出部分截断。"
-    },
-
-    "knowledgeBase": {
-      "_comment": "长期记忆知识库配置。使用嵌入模型和重排序模型进行语义搜索。",
-
-      "enabled": true,
-      "_enabled": "是否启用知识库。",
-
-      "maxResults": 10,
-      "_maxResults": "搜索返回的最大结果数。",
-
-      "_vectorDimension": "可选。设置后将严格校验嵌入向量维度（不符则报错拒绝入库）；不设置则不校验。例如 \"vectorDimension\": 1024。"
     },
 
     "activeModels": {
@@ -169,7 +135,11 @@
     },
 
     "plugins": {
-      "_comment": "插件运行时状态。已加载的插件自动在此生成条目。键名为插件的 manifest.name。"
+      "_comment": "插件启用状态。键名为插件的 manifest.name，值只含 enabled（true/false）。内置插件：builtin-summary / builtin-knowledge / builtin-reply / builtin-notify（核心命令 /help、/status 等由 builtin-summary 注册）。各插件的业务配置不在此处，而是存放在插件 storage 命名空间的 config 键（data/plugins/<name>.json）。",
+      "builtin-summary": { "enabled": true },
+      "builtin-knowledge": { "enabled": true },
+      "builtin-reply": { "enabled": true },
+      "builtin-notify": { "enabled": true }
     },
 
     "ui": {

@@ -6,7 +6,12 @@
  * Run: npx tsx test/commands.test.ts
  */
 
-import { registerBuiltinCommands, CommandBus } from '../src/commands';
+import { CommandBus } from '../src/commands';
+import { registerCoreCommands } from '../src/plugins/builtin/commands-core';
+import { registerKnowledgeCommands } from '../src/plugins/builtin/commands-knowledge';
+import { registerReplyCommands } from '../src/plugins/builtin/commands-reply';
+import { ReplyManager } from '../src/reply';
+import type { PluginContext } from '../src/types';
 import type {
   AppServices,
   CommandDispatchResult,
@@ -70,22 +75,10 @@ function createMockRuntimeStore(overrides: Partial<RuntimeState> = {}): RuntimeS
         actionTimeoutMs: 3000,
       },
     },
-    summary: {
-      enabled: false,
-      intervalMs: 120000,
-      batchSize: 20,
-      maxEventsPerPrompt: 40,
-    },
-    knowledgeBase: {
-      enabled: true,
-      maxResults: 10,
-      vectorDimension: 8,
-    },
     activeModels: {},
     models: { language: [], 'speech-to-text': [], embedding: [], rerank: [] },
     plugins: {},
     ui: { enabled: false, title: 'Test' },
-    notifyKeywords: [],
     ...overrides,
   };
 
@@ -337,10 +330,30 @@ async function main(): Promise<void> {
     appLogger: services.appLogger,
   });
 
-  registerBuiltinCommands({
-    ...services,
-    commands,
-  });
+  const replies = new ReplyManager({ models: services.models, appLogger: services.appLogger });
+  const mockCtx: PluginContext = {
+    manifest: { name: 'test', version: '1.0.0', permissions: [] },
+    bot: services.bot,
+    models: services.models,
+    storage: services.storage.namespace('test'),
+    commands: { register: (cmd) => commands.register(cmd) },
+    runtime: services.runtime,
+    knowledge: undefined,
+    summaryControl: undefined,
+    replyControl: undefined,
+    knowledgeControl: undefined,
+    webui: undefined,
+    logger: services.appLogger,
+  };
+  const summaries = {
+    flush: async () => null,
+    start: async () => {},
+    stop: async () => {},
+    status: async () => ({ enabled: true, intervalMs: 120000, batchSize: 5, cursorEventId: undefined, lastGeneratedAt: undefined }),
+  };
+  registerCoreCommands(mockCtx, services, summaries as never);
+  registerKnowledgeCommands(mockCtx, services);
+  registerReplyCommands(mockCtx, replies);
 
   await test('/help is registered as admin-only', async () => {
     const help = commands.list().find((command) => command.name === 'help');

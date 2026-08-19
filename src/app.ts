@@ -2,16 +2,14 @@ import type Hapi from '@hapi/hapi';
 
 import { createDefaultAppSettings, createDefaultRuntimeState } from './config';
 import { DEFAULT_CONFIG_PATH, JsonConfigStore } from './config-store';
-import { registerBuiltinCommands, CommandBus } from './commands';
-import { KnowledgeService } from './knowledge';
+import { CommandBus } from './commands';
+import { registerBuiltinPlugins } from './builtin';
 import { createLogger } from './logger';
 import { ModelRegistry } from './models';
 import { normalizeOneBotMessageEvent, OneBotClient } from './onebot';
 import { OneBotWebSocketTransport } from './onebot-ws';
 import { AdminPolicy } from './policies';
 import { PluginManager } from './plugins';
-import { ReplyManager } from './reply';
-import { SummaryWorker } from './summary';
 import { FileStore } from './storage';
 import type {
   AppServices,
@@ -19,29 +17,14 @@ import type {
   CommandDispatchResult,
   CommandRecord,
   JsonObject,
+  JsonValue,
   NormalizedMessageEvent,
   OneBotIncomingEvent,
 } from './types';
 import { createWebServer } from './webui';
 
-/** Parse an HH:MM string to minutes-since-midnight, or null if malformed. */
-function parseHhmm(value: string): number | null {
-  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
-  if (!match) return null;
-  const h = Number(match[1]);
-  const m = Number(match[2]);
-  if (h > 23 || m > 59) return null;
-  return h * 60 + m;
-}
-
-/** Robust quiet-hours check that handles overnight windows and un-padded times. */
-function isWithinQuietHours(nowMinutes: number, start: string, end: string): boolean {
-  const s = parseHhmm(start);
-  const e = parseHhmm(end);
-  if (s === null || e === null || s === e) return false;
-  return s < e
-    ? nowMinutes >= s && nowMinutes < e
-    : nowMinutes >= s || nowMinutes < e;
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 export class BotApplication {
@@ -55,12 +38,11 @@ export class BotApplication {
   readonly models: ModelRegistry;
   readonly commands: CommandBus;
   readonly plugins: PluginManager;
-  readonly summaries: SummaryWorker;
-  readonly knowledge: KnowledgeService;
   readonly policy: AdminPolicy;
-  readonly replies: ReplyManager;
   readonly services: AppServices;
   private server: Hapi.Server | null = null;
+  /** 内置服务句柄，由内置插件在 setup 时填充，用于优雅关闭 */
+  private builtinStoppers: Array<() => Promise<void>> = [];
 
   constructor(settings = createDefaultAppSettings(), configPath = DEFAULT_CONFIG_PATH) {
     this.settings = settings;
@@ -75,10 +57,8 @@ export class BotApplication {
     });
     this.bot.setActionTransport(this.oneBotWebSocket);
     this.models = new ModelRegistry(this.runtime, this.logger.child('models'));
-    this.replies = new ReplyManager({
-      models: this.models,
-      appLogger: this.logger.child('replies'),
-    });
+
+    // CommandBus 是内核基础设施（插件需要注册命令），在内核构造
     this.commands = new CommandBus({
       bot: this.bot,
       models: this.models,
@@ -87,31 +67,17 @@ export class BotApplication {
       appLogger: this.logger.child('commands'),
     });
 
-    this.knowledge = new KnowledgeService({
-      runtime: this.runtime,
-      storage: this.store,
-      models: this.models,
-      appLogger: this.logger.child('knowledge'),
-    });
-
+    // KnowledgeService 引用：由内置 knowledge 插件在 setup 时填充
+    // PluginManager 通过 services.knowledge 向其他插件暴露知识库网关
     this.plugins = new PluginManager({
       runtime: this.runtime,
       bot: this.bot,
       models: this.models,
       storage: this.store,
       commands: this.commands,
-      knowledge: this.knowledge,
+      knowledge: undefined,
       appLogger: this.logger.child('plugins'),
       pluginSearchDirs: this.settings.pluginSearchDirs,
-    });
-    this.summaries = new SummaryWorker({
-      runtime: this.runtime,
-      storage: this.store,
-      bot: this.bot,
-      models: this.models,
-      plugins: this.plugins,
-      replies: this.replies,
-      appLogger: this.logger.child('summaries'),
     });
 
     this.policy = new AdminPolicy(createDefaultRuntimeState());
@@ -123,17 +89,93 @@ export class BotApplication {
       storage: this.store,
       commands: this.commands,
       plugins: this.plugins,
-      summaries: this.summaries,
-      knowledge: this.knowledge,
       appLogger: this.logger,
-    };
+    } as AppServices;
+  }
+
+  /** 内置插件在 setup 时调用，注入 knowledge 服务引用（供其他插件使用） */
+  setKnowledgeService(knowledge: AppServices['knowledge']): void {
+    (this.plugins as unknown as { deps: { knowledge: AppServices['knowledge'] } }).deps.knowledge = knowledge;
+    (this.services as { knowledge: AppServices['knowledge'] | undefined }).knowledge = knowledge;
+  }
+
+  /** 内置插件在 setup 时调用，注入 summary 服务引用 */
+  setSummaryService(summaries: AppServices['summaries']): void {
+    (this.services as { summaries: AppServices['summaries'] | undefined }).summaries = summaries;
+  }
+
+  /**
+   * 一次性迁移：把旧版 config.json runtime 里的业务配置（summary /
+   * knowledgeBase / notifyKeywords / quietHours，以及 plugins.*.config 残留）
+   * 搬进各内置插件的 storage 命名空间（config 键），随后写回干净的 config.json。
+   * 幂等：迁移完成即重写 config.json，下次启动旧字段已不存在，直接跳过。
+   * 注意必须读原始文件——normalize 在加载时已经把这些字段丢弃了。
+   */
+  private async migrateLegacyPluginConfigs(): Promise<void> {
+    const raw = await this.config.readRawConfig();
+    const legacy = raw?.runtime;
+    if (!legacy || typeof legacy !== 'object') return;
+
+    const legacyRuntime = legacy as unknown as Record<string, unknown>;
+    let migrated = 0;
+    let disableKnowledge = false;
+
+    if (isPlainObject(legacyRuntime.summary)) {
+      await this.store.namespace('builtin-summary').set('config', legacyRuntime.summary as JsonValue);
+      migrated += 1;
+    }
+    if (isPlainObject(legacyRuntime.knowledgeBase)) {
+      // 知识库开关迁移到插件启用状态：旧 enabled=false → 禁用 builtin-knowledge。
+      // 存储的 config 不带冗余的 enabled（status() 会用插件状态覆盖）。
+      const kb = legacyRuntime.knowledgeBase as Record<string, unknown>;
+      const { enabled: legacyEnabled, ...rest } = kb;
+      await this.store.namespace('builtin-knowledge').set('config', rest as unknown as JsonValue);
+      if (legacyEnabled === false) disableKnowledge = true;
+      migrated += 1;
+    }
+    if (Array.isArray(legacyRuntime.notifyKeywords) || legacyRuntime.quietHours !== undefined) {
+      await this.store.namespace('builtin-notify').set('config', {
+        notifyKeywords: Array.isArray(legacyRuntime.notifyKeywords)
+          ? legacyRuntime.notifyKeywords.filter((k): k is string => typeof k === 'string')
+          : [],
+        quietHours: legacyRuntime.quietHours ?? null,
+      } as unknown as JsonValue);
+      migrated += 1;
+    }
+
+    // 插件条目里残留的 config（旧 PluginRuntimeState 曾携带 config 对象）
+    const plugins = legacyRuntime.plugins;
+    const pluginConfigResidue =
+      isPlainObject(plugins) &&
+      Object.values(plugins as Record<string, unknown>).some(
+        (p) => isPlainObject(p) && (p as Record<string, unknown>).config !== undefined,
+      );
+
+    if (migrated === 0 && !pluginConfigResidue) return;
+
+    this.logger.info('legacy plugin configs migrated into plugin storage', {
+      namespaces: migrated,
+      pluginConfigResidue,
+    });
+
+    // 先强制把插件命名空间的写入落盘，再清理 config.json——若中途崩溃，
+    // config.json 仍保留旧字段，下次启动会重新迁移（幂等），不会丢数据。
+    await this.store.flush();
+
+    // 用规范化后的 runtime 整体写回：旧业务字段与 plugins.*.config 残留一并消失，
+    // `_comment` 文档键（preserveCommentKeys）会保留。
+    const nextRuntime = await this.runtime.snapshot();
+    if (disableKnowledge) {
+      nextRuntime.plugins['builtin-knowledge'] = { enabled: false };
+    }
+    await this.runtime.replace(nextRuntime);
   }
 
   async initialize(): Promise<void> {
     await this.config.ensureReady();
     await this.store.ensureReady();
+    await this.migrateLegacyPluginConfigs();
 
-    // Warn if only fallback models are configured
     if (await this.models.hasOnlyFallbackModels()) {
       this.logger.warn('============================================================');
       this.logger.warn('NO REAL AI MODELS CONFIGURED — only rule-based fallbacks.');
@@ -144,20 +186,20 @@ export class BotApplication {
       this.logger.warn('============================================================');
     }
 
-    await this.knowledge.start();
+    // 注册内置插件（summary/knowledge/reply/commands/notify）
+    await registerBuiltinPlugins(this.plugins, this.services, this);
+
     const runtime = await this.runtime.snapshot();
     this.policy.updateRuntime(runtime);
-    registerBuiltinCommands(this.services, this.replies);
     await this.plugins.load();
-    await this.summaries.start();
     this.server = await createWebServer({
       settings: this.settings,
       config: this.config,
       runtime: this.runtime,
       models: this.models,
       plugins: this.plugins,
-      summaries: this.summaries,
-      knowledge: this.knowledge,
+      knowledge: this.services.knowledge,
+      summaries: this.services.summaries,
       storage: this.store,
       oneBotWebSocket: this.oneBotWebSocket,
       handleIncomingEvent: this.handleIncomingEvent.bind(this),
@@ -181,11 +223,6 @@ export class BotApplication {
     await this.logStartupChecklist();
   }
 
-  /**
-   * One-glance startup summary with actionable hints for anything missing.
-   * New deployments otherwise hit a chicken-and-egg: with no admins configured
-   * nobody can run commands, and nothing tells the operator what to do next.
-   */
   private async logStartupChecklist(): Promise<void> {
     try {
       const runtime = await this.runtime.snapshot();
@@ -226,12 +263,18 @@ export class BotApplication {
   }
 
   async stop(): Promise<void> {
-    // The store flush is the one step that loses data if skipped, so it runs
-    // in a finally: a throw from any teardown step above must not bypass it.
     try {
       await this.oneBotWebSocket.dispose();
-      await this.summaries.stop();
-      await this.knowledge.stop();
+      for (const stop of this.builtinStoppers) {
+        try {
+          await stop();
+        } catch (error) {
+          this.logger.warn('builtin service stop failed', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      this.builtinStoppers = [];
       await this.plugins.shutdown();
       if (this.server) {
         await this.server.stop();
@@ -240,6 +283,11 @@ export class BotApplication {
     } finally {
       await this.store.close();
     }
+  }
+
+  /** 内置插件注册的关闭钩子 */
+  registerBuiltinStopper(stop: () => Promise<void>): void {
+    this.builtinStoppers.push(stop);
   }
 
   async handleIncomingEvent(payload: JsonObject, _headers: Record<string, unknown>): Promise<{
@@ -273,54 +321,9 @@ export class BotApplication {
       });
     });
 
-    // Classify non-admin non-bot messages for potential reply requests
-    if (!event.visibility.fromAdmin && !event.visibility.fromBot) {
-      void this.replies
-        .classifyMessage(event)
-        .then((needsReply) => {
-          if (needsReply) this.replies.addPending(event);
-        })
-        .catch((error) => {
-          this.logger.warn('reply classification failed', {
-            eventId: event.id,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-
-      // Keyword notification: instantly notify admins of matching messages
-      const keywords = runtime.notifyKeywords;
-      if (keywords && keywords.length > 0) {
-        const text = event.content.text.toLowerCase();
-        const matched = keywords.find((kw) => text.includes(kw.toLowerCase()));
-        if (matched) {
-          // Check quiet hours
-          const qh = runtime.quietHours;
-          let inQuiet = false;
-          if (qh) {
-            const now = new Date();
-            inQuiet = isWithinQuietHours(now.getHours() * 60 + now.getMinutes(), qh.start, qh.end);
-          }
-
-          if (!inQuiet) {
-            const sender = event.sender.nickname ?? event.sender.userId;
-            const scope = event.scope === 'group'
-              ? `群 ${event.conversationId.replace(/^group:/, '')}`
-              : '私聊';
-            const alert = `🔔 关键词告警: "${matched}"\n发送者: ${sender} (${event.sender.userId})\n来源: ${scope}\n内容: ${event.content.text.slice(0, 300)}`;
-            for (const adminId of runtime.admins) {
-              void this.bot.sendPrivateMessage(adminId, alert).catch(() => {});
-            }
-          }
-        }
-      }
-    }
-
     if (event.visibility.fromAdmin) {
       const isCommand = event.content.text.trim().startsWith('/');
       if (isCommand) {
-        // A throwing command handler must still produce an audit record and a
-        // reply — otherwise the admin gets complete silence and the only trace
-        // is a transport-level log line.
         let result: CommandDispatchResult;
         let failure: string | undefined;
         try {
@@ -358,11 +361,6 @@ export class BotApplication {
         }
 
         return { accepted: true, commandHandled: result.handled };
-      }
-
-      if (this.policy.shouldGenerateAdvice(event)) {
-        await this.summaries.advise(event);
-        return { accepted: true };
       }
 
       return { accepted: true };

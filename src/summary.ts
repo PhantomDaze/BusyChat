@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
 import { chunkWithPrefixBudget } from './onebot';
-import type { ReplyManager } from './reply';
 import type {
   AdviceGenerationContext,
   AdviceRecord,
@@ -9,8 +8,10 @@ import type {
   Logger,
   ModelTask,
   NormalizedMessageEvent,
+  PluginConfigStore,
   SummaryGenerationContext,
   SummaryRecord,
+  SummarySettings,
 } from './types';
 
 interface SummaryWorkerDependencies {
@@ -19,7 +20,10 @@ interface SummaryWorkerDependencies {
   bot: AppServices['bot'];
   models: AppServices['models'];
   plugins: AppServices['plugins'];
-  replies: ReplyManager;
+  /** 摘要插件配置（存于插件 storage 命名空间，含运行书签 cursorEventId/lastGeneratedAt） */
+  config: PluginConfigStore<SummarySettings>;
+  /** 用于在摘要末尾附加待回复消息；由内置 reply 插件在 setup 时注入 */
+  replyFormatter?: (() => string) | null;
   appLogger: Logger;
 }
 
@@ -213,8 +217,11 @@ export class SummaryWorker {
 
   async start(): Promise<void> {
     await this.stop();
-    const runtime = await this.deps.runtime.snapshot();
-    if (!runtime.summary.enabled) {
+    const [runtime, cfg] = await Promise.all([
+      this.deps.runtime.snapshot(),
+      this.deps.config.get(),
+    ]);
+    if (!cfg.enabled) {
       this.deps.appLogger.info('summary worker disabled');
       return;
     }
@@ -223,7 +230,7 @@ export class SummaryWorker {
       this.deps.appLogger.warn('summary worker started but NO ADMINS configured — summaries will not be delivered. Use /admin add <QQ> to add recipients.');
     }
 
-    const intervalMs = runtime.summary.intervalMs;
+    const intervalMs = cfg.intervalMs;
     this.timer = setInterval(() => {
       void this.flush('interval').catch((error) => {
         this.deps.appLogger.error('summary flush failed', {
@@ -234,7 +241,7 @@ export class SummaryWorker {
 
     this.deps.appLogger.info('summary worker started', {
       intervalMs,
-      batchSize: runtime.summary.batchSize,
+      batchSize: cfg.batchSize,
       admins: runtime.admins.length,
     });
   }
@@ -250,16 +257,18 @@ export class SummaryWorker {
     enabled: boolean;
     intervalMs: number;
     batchSize: number;
+    maxEventsPerPrompt: number;
     cursorEventId: string | undefined;
     lastGeneratedAt: string | undefined;
   }> {
-    const runtime = await this.deps.runtime.snapshot();
+    const cfg = await this.deps.config.get();
     return {
-      enabled: runtime.summary.enabled,
-      intervalMs: runtime.summary.intervalMs,
-      batchSize: runtime.summary.batchSize,
-      cursorEventId: runtime.summary.cursorEventId,
-      lastGeneratedAt: runtime.summary.lastGeneratedAt,
+      enabled: cfg.enabled,
+      intervalMs: cfg.intervalMs,
+      batchSize: cfg.batchSize,
+      maxEventsPerPrompt: cfg.maxEventsPerPrompt,
+      cursorEventId: cfg.cursorEventId,
+      lastGeneratedAt: cfg.lastGeneratedAt,
     };
   }
 
@@ -280,8 +289,11 @@ export class SummaryWorker {
   }
 
   private async flushInner(reason: string): Promise<SummaryRecord | null> {
-    const runtime = await this.deps.runtime.snapshot();
-    if (!runtime.summary.enabled) {
+    const [runtime, cfg] = await Promise.all([
+      this.deps.runtime.snapshot(),
+      this.deps.config.get(),
+    ]);
+    if (!cfg.enabled) {
       this.deps.appLogger.info('summary flush skipped: disabled');
       return null;
     }
@@ -295,12 +307,12 @@ export class SummaryWorker {
     // Relying on the storage default (500) breaks backlog detection whenever
     // maxEventsPerPrompt >= that cap — backlog would always read 0.
     const allEvents = await this.deps.storage.listEventsAfter(
-      runtime.summary.cursorEventId,
-      runtime.summary.maxEventsPerPrompt + 1,
+      cfg.cursorEventId,
+      cfg.maxEventsPerPrompt + 1,
     );
     if (allEvents.length === 0) {
       this.deps.appLogger.debug('summary flush skipped: no new events since cursor', {
-        cursorEventId: runtime.summary.cursorEventId ?? '(none)',
+        cursorEventId: cfg.cursorEventId ?? '(none)',
       });
       return null;
     }
@@ -310,7 +322,7 @@ export class SummaryWorker {
     // successive flushes instead of being silently skipped (taking the newest
     // slice while advancing the cursor to the newest event would permanently
     // drop everything in between).
-    const limitedEvents = allEvents.slice(0, runtime.summary.maxEventsPerPrompt);
+    const limitedEvents = allEvents.slice(0, cfg.maxEventsPerPrompt);
     const backlog = allEvents.length - limitedEvents.length;
     if (backlog > 0) {
       this.deps.appLogger.info('summary backlog: processing oldest batch first', {
@@ -330,17 +342,18 @@ export class SummaryWorker {
     }
 
     if (contextEvents.length === 0) {
-      await this.deps.runtime.update((state) => {
-        state.summary.cursorEventId = lastEvent.id;
-        state.summary.lastGeneratedAt = nowIso();
-      });
+      await this.deps.config.update((current) => ({
+        ...current,
+        cursorEventId: lastEvent.id,
+        lastGeneratedAt: nowIso(),
+      }));
       return null;
     }
 
     // The batch threshold avoids summarizing a trickle of chat — but only apply
     // it when nothing is queued behind this batch, otherwise a backlog whose
     // oldest slice is under the threshold would block the cursor forever.
-    if (reason === 'interval' && backlog === 0 && reportableEvents.length < runtime.summary.batchSize) {
+    if (reason === 'interval' && backlog === 0 && reportableEvents.length < cfg.batchSize) {
       return null;
     }
 
@@ -379,12 +392,13 @@ export class SummaryWorker {
     };
 
     await this.deps.storage.appendSummary(summaryRecord);
-    await this.deps.runtime.update((state) => {
-      state.summary.cursorEventId = lastEvent.id;
-      state.summary.lastGeneratedAt = summaryRecord.createdAt;
-    });
+    await this.deps.config.update((current) => ({
+      ...current,
+      cursorEventId: lastEvent.id,
+      lastGeneratedAt: summaryRecord.createdAt,
+    }));
 
-    const pendingSection = this.deps.replies.formatPendingForSummary();
+    const pendingSection = this.deps.replyFormatter ? this.deps.replyFormatter() : '';
     const fullText = `摘要：\n${summaryRecord.summaryText}\n\n建议：\n${summaryRecord.suggestionsText}${pendingSection}`;
     const chunks = chunkWithPrefixBudget(fullText);
     for (const recipientId of recipients) {

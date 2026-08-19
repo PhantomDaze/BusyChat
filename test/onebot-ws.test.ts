@@ -203,12 +203,6 @@ function createMockRuntimeStore(overrides: Partial<RuntimeState>): RuntimeStore 
         actionTimeoutMs: 3000,
       },
     },
-    summary: {
-      enabled: false,
-      intervalMs: 120000,
-      batchSize: 20,
-      maxEventsPerPrompt: 40,
-    },
     activeModels: {},
     models: { language: [], 'speech-to-text': [], embedding: [], rerank: [] },
     plugins: {},

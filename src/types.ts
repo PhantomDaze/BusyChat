@@ -31,7 +31,11 @@ export type PluginPermission =
   | 'storage:write'
   | 'command:register'
   | 'knowledge:read'
-  | 'knowledge:write';
+  | 'knowledge:write'
+  | 'summary:control'
+  | 'reply:control'
+  | 'knowledge:control'
+  | 'webui:route';
 
 export interface OneBotMessageSegment {
   type: string;
@@ -308,17 +312,18 @@ export interface NamespacedStorage {
   listKeys(): Promise<string[]>;
 }
 
+/**
+ * 内核运行时状态。只含内核组件（策略、传输、模型注册表、插件管理器、WebUI）
+ * 自己的数据；插件的业务配置不在此处，每个插件通过 PluginContext.config 访问
+ * 自己的配置（存储在插件 storage 命名空间的 `config` 键）。
+ */
 export interface RuntimeState {
   admins: string[];
   onebot: OneBotClientConfig;
-  summary: SummarySettings;
-  knowledgeBase: KnowledgeBaseSettings;
   activeModels: Partial<Record<ModelTask, string>>;
   models: Record<ModelFamily, ModelConfig[]>;
   plugins: Record<string, PluginRuntimeState>;
   ui: UiSettings;
-  notifyKeywords: string[];
-  quietHours?: { start: string; end: string };
 }
 
 export interface AppSettings {
@@ -370,9 +375,27 @@ export interface UiSettings {
   password?: string;
 }
 
+/**
+ * 插件运行时状态。只记录启停；插件自身的配置通过
+ * PluginContext.config 存进插件 storage 命名空间，不放在 config.json。
+ */
 export interface PluginRuntimeState {
   enabled: boolean;
-  config: JsonObject;
+}
+
+/**
+ * 插件配置访问器：每个插件用它读写自己的配置。
+ * 配置保存在插件 storage 命名空间的 `config` 键下。
+ * 用 object（而非 JsonValue）约束：插件的配置接口（SummarySettings 等）
+ * 是普通对象类型，没有 JsonObject 的索引签名。
+ */
+export interface PluginConfigStore<T extends object = JsonObject> {
+  /** 读取当前配置；未设置过时返回传入的默认值 */
+  get(): Promise<T>;
+  /** 基于当前配置调用 mutator 并写回，返回新配置 */
+  update(mutator: (config: T) => T): Promise<T>;
+  /** 重置为显式传入的配置 */
+  reset(config: T): Promise<T>;
 }
 
 export interface PluginManifest {
@@ -415,6 +438,7 @@ export interface CommandContext {
   bot: BotGateway;
   models: ModelGateway;
   storage: NamespacedStorage;
+  config: PluginConfigStore<JsonObject>;
   runtime: RuntimeReader;
   logger: Logger;
   reply(message: OutgoingMessage): Promise<void>;
@@ -440,6 +464,53 @@ export interface CommandRegistrar {
   register(command: CommandDefinition): void;
 }
 
+export interface SummaryControl {
+  flush(reason: string): Promise<SummaryRecord | null>;
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  status(): Promise<{
+    enabled: boolean;
+    intervalMs: number;
+    batchSize: number;
+    maxEventsPerPrompt: number;
+    cursorEventId: string | undefined;
+    lastGeneratedAt: string | undefined;
+  }>;
+}
+
+export interface ReplyControl {
+  listPending(): Array<{
+    id: string;
+    createdAt: string;
+    sourceEvent: NormalizedMessageEvent;
+    status: 'pending' | 'replied' | 'dismissed';
+  }>;
+  generateReply(
+    pending: { id: string; sourceEvent: NormalizedMessageEvent },
+    instruction: string,
+  ): Promise<{ target: SendTarget; message: OutgoingMessage; reasoning: string }>;
+  dismiss(id: string): boolean;
+  formatPendingForSummary(): string;
+}
+
+export interface KnowledgeControl {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  status(): Promise<KnowledgeBaseSettings>;
+}
+
+export interface WebUiRouteHandler {
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  path: string;
+  handler: (payload: JsonObject | undefined, query: Record<string, unknown>) => MaybePromise<JsonObject>;
+  label?: string;
+  requireAuth?: boolean;
+}
+
+export interface WebUiRouteRegistrar {
+  register(route: WebUiRouteHandler): void;
+}
+
 export interface PluginRuntimeReader {
   snapshot(): Promise<RuntimeState>;
 }
@@ -449,9 +520,15 @@ export interface PluginContext {
   bot: BotGateway;
   models: ModelGateway;
   storage: NamespacedStorage;
+  /** 插件自己的配置访问器（读写插件 storage 命名空间的 `config` 键） */
+  config: PluginConfigStore<JsonObject>;
   commands: CommandRegistrar;
   runtime: PluginRuntimeReader;
   knowledge: KnowledgeGateway | undefined;
+  summaryControl: SummaryControl | undefined;
+  replyControl: ReplyControl | undefined;
+  knowledgeControl: KnowledgeControl | undefined;
+  webui: WebUiRouteRegistrar | undefined;
   logger: Logger;
 }
 
@@ -527,11 +604,13 @@ export interface AppServices {
     dispatchSummary(summary: SummaryRecord): Promise<void>;
     dispatchAdvice(advice: AdviceRecord): Promise<void>;
     shutdown(): Promise<void>;
-    list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined }>>;
+    list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined; filePath?: string }>>;
     setEnabled(name: string, enabled: boolean): Promise<void>;
     reload(): Promise<void>;
+    reloadOne(name: string): Promise<void>;
+    collectWebUiRoutes(): Array<{ owner: string; route: WebUiRouteHandler }>;
   };
-  summaries: {
+  summaries?: {
     flush(reason: string): Promise<SummaryRecord | null>;
     start(): Promise<void>;
     stop(): Promise<void>;
@@ -543,6 +622,6 @@ export interface AppServices {
       lastGeneratedAt: string | undefined;
     }>;
   };
-  knowledge: KnowledgeServiceApi;
+  knowledge?: KnowledgeServiceApi;
   appLogger: Logger;
 }
