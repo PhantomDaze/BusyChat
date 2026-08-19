@@ -71,10 +71,12 @@ async function main(): Promise<void> {
       listTasks() { return ['summary']; },
       listFamilies() { return ['language', 'embedding', 'rerank', 'speech-to-text']; },
       async hasOnlyFallbackModels() { return false; },
+      async testConnection() { return 'ok'; },
+      async listRemoteModels() { return ['m1', 'm2']; },
     } as any,
-    plugins: { async list() { return []; } } as any,
+    plugins: { async list() { return []; }, collectWebUiRoutes: () => [] } as any,
     summaries: { async status() { return {}; }, async start() {} } as any,
-    knowledge: { async list() { return []; } } as any,
+    knowledge: { async list() { return []; }, async status() { return { enabled: true, maxResults: 10 }; } } as any,
     storage: {
       listSummaries: empty, listAdvice: empty, listCommands: empty, listEventsAfter: empty,
       countKnowledgeEntries: async () => 0,
@@ -124,6 +126,37 @@ async function main(): Promise<void> {
   const body = JSON.stringify(state);
   check('apiKey is not leaked in /api/state', !body.includes('sk-SECRETKEY123456'));
   check('ui password is not leaked in /api/state', !body.includes(PASSWORD));
+
+  // 5.5 Model probe APIs (test connection / fetch remote models).
+  const testProbe = await fetch(`${base}/api/models/test`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify({ family: 'language', provider: 'openai-compatible', parameters: { baseUrl: 'https://x/v1' } }),
+  });
+  const testProbeBody = (await testProbe.json()) as { ok: boolean; message?: string };
+  check('model test endpoint returns ok with valid probe', testProbe.status === 200 && testProbeBody.ok === true);
+
+  const fetchProbe = await fetch(`${base}/api/models/fetch`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify({ family: 'embedding', provider: 'openai-compatible', parameters: { baseUrl: 'https://x/v1' } }),
+  });
+  const fetchProbeBody = (await fetchProbe.json()) as { ok: boolean; models?: string[] };
+  check(
+    'model fetch endpoint returns a model list',
+    fetchProbe.status === 200 && fetchProbeBody.ok === true && Array.isArray(fetchProbeBody.models),
+  );
+
+  const badProbe = await fetch(`${base}/api/models/test`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify({ family: 'nope', provider: 'openai-compatible', parameters: {} }),
+  });
+  const badProbeBody = (await badProbe.json()) as { ok: boolean; message?: string };
+  check('model test endpoint rejects an invalid family', badProbe.status === 200 && badProbeBody.ok === false);
+
+  const anonProbe = await fetch(`${base}/api/models/test`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ family: 'language', provider: 'openai-compatible', parameters: { baseUrl: 'https://x/v1' } }),
+  });
+  check('model probe endpoint rejects without auth', anonProbe.status === 401);
 
   // 6. Logout revokes the token.
   await fetch(`${base}/api/logout`, { method: 'POST', headers: { 'x-admin-token': token } });

@@ -277,6 +277,10 @@ export interface ModelProvider {
   transcribe?(request: SpeechToTextRequest): Promise<SpeechToTextResponse>;
   embed?(request: EmbeddingRequest): Promise<EmbeddingResponse>;
   rerank?(request: RerankRequest): Promise<RerankResponse>;
+  /** 从上游 API 拉取可用模型 id 列表（如 GET /v1/models），供 WebUI 展示 */
+  listRemoteModels?(config: ModelConfig): Promise<string[]>;
+  /** 测试与上游的连接，返回人类可读的结果（WebUI 测试连接按钮） */
+  testConnection?(config: ModelConfig): Promise<string>;
 }
 
 export interface ModelGateway {
@@ -296,6 +300,10 @@ export interface ModelAdminGateway extends ModelGateway {
   setActiveModel(task: ModelTask, modelId: string): Promise<void>;
   removeModel(modelId: string): Promise<void>;
   hasOnlyFallbackModels(): Promise<boolean>;
+  /** 拉取指定模型配置对应上游的可用模型 id 列表 */
+  listRemoteModels(model: ModelConfig): Promise<string[]>;
+  /** 测试指定模型配置与上游的连接，返回人类可读结果 */
+  testConnection(model: ModelConfig): Promise<string>;
 }
 
 export interface BotGateway {

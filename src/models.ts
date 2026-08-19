@@ -369,6 +369,56 @@ class OpenAICompatibleProvider implements ModelProvider {
 
     return { ranking, raw: payload };
   }
+
+  /** GET {base}/models 拉取上游可用模型 id 列表。 */
+  async listRemoteModels(config: ModelConfig): Promise<string[]> {
+    const baseUrl = String(config.parameters.baseUrl ?? '').trim();
+    if (!baseUrl) {
+      throw new Error('拉取模型列表需要 baseUrl 参数');
+    }
+    const apiKey = String(config.parameters.apiKey ?? '').trim();
+    const timeoutMs = resolveTimeoutMs(config.parameters.timeoutMs);
+
+    const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+    const response = await fetch(new URL('models', normalizedBase), {
+      method: 'GET',
+      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(
+        `拉取模型列表失败: ${response.status}${body ? ` - ${redactSecrets(body).slice(0, 200)}` : ''}`,
+      );
+    }
+
+    const payload = (await response.json()) as { data?: Array<{ id?: string }> };
+    const ids = (payload.data ?? []).map((item) => item.id ?? '').filter(Boolean);
+    if (ids.length === 0) {
+      throw new Error('上游返回了空的模型列表');
+    }
+    return ids;
+  }
+
+  /** 连通性测试：拉取模型列表，并校验配置的 model 是否可用。 */
+  async testConnection(config: ModelConfig): Promise<string> {
+    const model = String(config.parameters.model ?? '').trim();
+    const ids = await this.listRemoteModels(config);
+    const preview = ids.slice(0, 5).join(', ');
+
+    if (!model) {
+      return `连接成功，上游共 ${ids.length} 个模型（例如: ${preview}）`;
+    }
+    if (ids.includes(model)) {
+      return `连接成功，模型 ${model} 可用（共 ${ids.length} 个模型）`;
+    }
+    const fuzzy = ids.filter((id) => id.includes(model)).slice(0, 3);
+    if (fuzzy.length > 0) {
+      return `连接成功，但 ${model} 未精确匹配；发现相近: ${fuzzy.join(', ')}（共 ${ids.length} 个模型）`;
+    }
+    return `连接成功，但 ${model} 不在上游模型列表中（共 ${ids.length} 个模型，例如: ${preview}）`;
+  }
 }
 
 export class ModelRegistry implements ModelAdminGateway {
@@ -504,6 +554,24 @@ export class ModelRegistry implements ModelAdminGateway {
       if (models.some((m) => m.provider !== 'rule-based' && m.enabled)) return false;
     }
     return true;
+  }
+
+  /** 透传到 provider：拉取该模型配置对应上游的可用模型 id 列表。 */
+  async listRemoteModels(model: ModelConfig): Promise<string[]> {
+    const provider = this.providers.get(model.provider);
+    if (!provider?.listRemoteModels) {
+      throw new Error(`provider ${model.provider} 不支持拉取模型列表`);
+    }
+    return provider.listRemoteModels(model);
+  }
+
+  /** 透传到 provider：测试该模型配置与上游的连接。 */
+  async testConnection(model: ModelConfig): Promise<string> {
+    const provider = this.providers.get(model.provider);
+    if (!provider?.testConnection) {
+      throw new Error(`provider ${model.provider} 不支持连接测试`);
+    }
+    return provider.testConnection(model);
   }
 
   async generateText(
