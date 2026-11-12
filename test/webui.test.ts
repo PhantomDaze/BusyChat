@@ -218,11 +218,23 @@ async function main(): Promise<void> {
     corsProbe.headers.get('access-control-allow-origin') !== '*',
   );
 
-  // 10. Dashboard page ships a Content-Security-Policy.
+  // 10. Dashboard page: SPA shell always loadable, strict CSP applied.
   const page = await fetch(`${base}${settings.uiPath}`);
   const csp = page.headers.get('content-security-policy') ?? '';
-  check('UI page sends a CSP header', csp.includes("default-src 'none'"));
+  const contentType = page.headers.get('content-type') ?? '';
+  check('UI page is served as HTML', page.status === 200 && contentType.includes('text/html'));
+  check('UI page sends a CSP header', csp.includes("default-src 'self'"));
+  check('CSP allows same-origin workers but no third-party scripts', csp.includes("worker-src 'self' blob:") && csp.includes("script-src 'self'"));
   check('UI page sends no-referrer policy', page.headers.get('referrer-policy') === 'no-referrer');
+  check('UI page sends nosniff', page.headers.get('x-content-type-options') === 'nosniff');
+
+  // 11. Static file serving must not escape webui-dist.
+  const traversal = await fetch(`${base}${settings.uiPath}/..%2F..%2Fpackage.json`);
+  const traversalBody = await traversal.text();
+  check(
+    'path traversal is blocked',
+    traversal.status === 404 || !traversalBody.includes('"name": "f261agent"'),
+  );
 
   await server.stop();
 
