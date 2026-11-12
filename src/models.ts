@@ -43,6 +43,149 @@ function redactSecrets(text: string): string {
     .replace(/("?(?:api[_-]?key|authorization|token)"?\s*[:=]\s*"?)[^"\s,}]+/gi, '$1[redacted]');
 }
 
+/** 可重试的上游状态码：请求超时、限流、上游暂时不可用。 */
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+/** undici/fetch 在网络层失败时抛出的常见错误码。 */
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
+function isAbortError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === 'TimeoutError' || error.name === 'AbortError')
+  );
+}
+
+function isNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const cause = (error as { cause?: unknown }).cause;
+  const code =
+    cause && typeof cause === 'object'
+      ? (cause as { code?: unknown }).code
+      : undefined;
+  if (typeof code === 'string') {
+    return NETWORK_ERROR_CODES.has(code);
+  }
+  return error.name === 'TypeError' && /fetch failed|network/i.test(error.message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 解析 Retry-After（秒数或 HTTP 日期），统一封顶 10 秒。 */
+function retryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (!trimmed) return null;
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, 10_000);
+  }
+  const date = Date.parse(trimmed);
+  if (Number.isFinite(date)) {
+    return Math.max(0, Math.min(date - Date.now(), 10_000));
+  }
+  return null;
+}
+
+/** 指数退避：500ms * 2^attempt，附加 0..249ms 抖动；上游给了 Retry-After 时优先遵从。 */
+function computeRetryDelayMs(attempt: number, response: Response | null): number {
+  const hinted = response ? retryAfterMs(response.headers.get('retry-after')) : null;
+  if (hinted !== null) return hinted;
+  const base = 500 * 2 ** attempt;
+  return base + Math.floor(Math.random() * 250);
+}
+
+/** 释放响应体，避免重试前占着连接。 */
+async function discardBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // 忽略：body 可能已经被读取或不存在
+  }
+}
+
+/** 读取 parameters.maxRetries，非法值回落到 2，范围 0..5。 */
+function resolveMaxRetries(value: unknown): number {
+  const n = Math.trunc(Number(value));
+  if (!Number.isFinite(n)) return 2;
+  return Math.min(5, Math.max(0, n));
+}
+
+export interface FetchWithRetryOptions {
+  timeoutMs?: number;
+  /** 最大重试次数（不含首次请求），0..5，默认 2 */
+  maxRetries?: number;
+}
+
+/**
+ * 所有 OpenAI 兼容上游请求共用的重试封装。
+ *
+ * - 只重试网络错误、408、429、5xx；
+ * - 超时最多重试 1 次（POST 可能已到达上游，避免放大副作用）；
+ * - 其余可重试错误最多 maxRetries 次；
+ * - 每次尝试都使用独立的 AbortSignal.timeout；
+ * - 不记录请求头/请求体，因此不会把 apiKey 写进日志。
+ */
+export async function fetchWithRetry(
+  url: URL | string,
+  init: Omit<RequestInit, 'signal'>,
+  options: FetchWithRetryOptions = {},
+): Promise<Response> {
+  const timeoutMs = resolveTimeoutMs(options.timeoutMs);
+  const maxRetries = resolveMaxRetries(options.maxRetries);
+  let attempt = 0;
+  let timeoutRetried = false;
+
+  for (;;) {
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!response.ok && isRetryableStatus(response.status) && attempt < maxRetries) {
+        const delay = computeRetryDelayMs(attempt, response);
+        await discardBody(response);
+        await sleep(delay);
+        attempt += 1;
+        continue;
+      }
+      return response;
+    } catch (error) {
+      if (isAbortError(error)) {
+        // 超时只重试一次：请求可能已经被上游接收，无限重试会重复执行。
+        if (!timeoutRetried && attempt < maxRetries) {
+          timeoutRetried = true;
+          await sleep(computeRetryDelayMs(attempt, null));
+          attempt += 1;
+          continue;
+        }
+        throw error;
+      }
+      if (isNetworkError(error) && attempt < maxRetries) {
+        await sleep(computeRetryDelayMs(attempt, null));
+        attempt += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 function tokenize(text: string): string[] {
   return text
     .toLowerCase()
@@ -217,26 +360,29 @@ class OpenAICompatibleProvider implements ModelProvider {
     const maxTokens = request.config.parameters.maxTokens;
 
     const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-    const response = await fetch(new URL('chat/completions', normalizedBase), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    const response = await fetchWithRetry(
+      new URL('chat/completions', normalizedBase),
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+            {
+              role: 'user',
+              content: request.input,
+            },
+          ],
+          temperature,
+          max_tokens: maxTokens,
+        }),
       },
-      body: JSON.stringify({
-        model,
-        messages: [
-          ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-          {
-            role: 'user',
-            content: request.input,
-          },
-        ],
-        temperature,
-        max_tokens: maxTokens,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+      { timeoutMs, maxRetries: resolveMaxRetries(request.config.parameters.maxRetries) },
+    );
 
     if (!response.ok) {
       throw new Error(`openai-compatible request failed with status ${response.status}`);
@@ -284,18 +430,21 @@ class OpenAICompatibleProvider implements ModelProvider {
     const timeoutMs = resolveTimeoutMs(request.config.parameters.timeoutMs);
 
     const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-    const response = await fetch(new URL('embeddings', normalizedBase), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    const response = await fetchWithRetry(
+      new URL('embeddings', normalizedBase),
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          input: request.inputs,
+        }),
       },
-      body: JSON.stringify({
-        model,
-        input: request.inputs,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+      { timeoutMs, maxRetries: resolveMaxRetries(request.config.parameters.maxRetries) },
+    );
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
@@ -330,19 +479,22 @@ class OpenAICompatibleProvider implements ModelProvider {
     const timeoutMs = resolveTimeoutMs(request.config.parameters.timeoutMs);
 
     const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-    const response = await fetch(new URL('rerank', normalizedBase), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    const response = await fetchWithRetry(
+      new URL('rerank', normalizedBase),
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          query: request.query,
+          documents: request.candidates,
+        }),
       },
-      body: JSON.stringify({
-        model,
-        query: request.query,
-        documents: request.candidates,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+      { timeoutMs, maxRetries: resolveMaxRetries(request.config.parameters.maxRetries) },
+    );
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
@@ -380,11 +532,14 @@ class OpenAICompatibleProvider implements ModelProvider {
     const timeoutMs = resolveTimeoutMs(config.parameters.timeoutMs);
 
     const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-    const response = await fetch(new URL('models', normalizedBase), {
-      method: 'GET',
-      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const response = await fetchWithRetry(
+      new URL('models', normalizedBase),
+      {
+        method: 'GET',
+        headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+      },
+      { timeoutMs, maxRetries: resolveMaxRetries(config.parameters.maxRetries) },
+    );
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
@@ -434,6 +589,11 @@ export class ModelRegistry implements ModelAdminGateway {
 
   registerProvider(provider: ModelProvider): void {
     this.providers.set(provider.name, provider);
+  }
+
+  /** 返回已注册的 provider 名称，供 WebUI/诊断展示。 */
+  listProviders(): string[] {
+    return [...this.providers.keys()];
   }
 
   listFamilies(): ModelFamily[] {
@@ -639,7 +799,13 @@ export class ModelRegistry implements ModelAdminGateway {
 
     if (provider?.generateText) {
       try {
-        return await provider.generateText(request);
+        const response = await provider.generateText(request);
+        // 标注实际响应来源，便于摘要等上层识别“真实模型 / 规则兜底”。
+        return {
+          ...response,
+          modelId: response.modelId ?? model.id,
+          provider: response.provider ?? model.provider,
+        };
       } catch (error) {
         this.logger.warn('text model provider failed, falling back', {
           task,
@@ -655,7 +821,21 @@ export class ModelRegistry implements ModelAdminGateway {
       throw new Error('rule-based provider is unavailable');
     }
 
-    return fallbackProvider.generateText(request);
+    const fallbackResponse = await fallbackProvider.generateText(request);
+    if (model.provider !== 'rule-based') {
+      // 配置的是真实模型但本次失败：显式标记降级，并把失败模型的来源带回去。
+      return {
+        ...fallbackResponse,
+        degraded: true,
+        modelId: model.id,
+        provider: model.provider,
+      };
+    }
+    return {
+      ...fallbackResponse,
+      modelId: fallbackResponse.modelId ?? model.id,
+      provider: fallbackResponse.provider ?? model.provider,
+    };
   }
 
   private async runSpeechTask(
@@ -673,7 +853,12 @@ export class ModelRegistry implements ModelAdminGateway {
 
     if (provider?.transcribe) {
       try {
-        return await provider.transcribe(request);
+        const response = await provider.transcribe(request);
+        return {
+          ...response,
+          modelId: model.id,
+          provider: model.provider,
+        } as SpeechToTextResponse & { modelId: string; provider: string };
       } catch (error) {
         this.logger.warn('speech-to-text provider failed, falling back', {
           modelId: model.id,
@@ -687,7 +872,20 @@ export class ModelRegistry implements ModelAdminGateway {
     if (!fallbackProvider?.transcribe) {
       throw new Error('rule-based provider is unavailable');
     }
-    return fallbackProvider.transcribe(request);
+    const fallbackResponse = await fallbackProvider.transcribe(request);
+    if (model.provider !== 'rule-based') {
+      return {
+        ...fallbackResponse,
+        degraded: true,
+        modelId: model.id,
+        provider: model.provider,
+      } as SpeechToTextResponse & {
+        degraded: true;
+        modelId: string;
+        provider: string;
+      };
+    }
+    return fallbackResponse;
   }
 
   private async runEmbeddingTask(inputs: string[], context: JsonObject): Promise<EmbeddingResponse> {
@@ -716,6 +914,9 @@ export class ModelRegistry implements ModelAdminGateway {
           throw error instanceof Error ? error : new Error(String(error));
         }
       }
+    } else if (model.provider !== 'rule-based') {
+      // 配置的真实 provider 不存在/未实现 embed：同样不能静默降级。
+      throw new Error(`embedding provider ${model.provider} is unavailable`);
     }
 
     const fallbackProvider = this.providers.get('rule-based');
@@ -741,7 +942,12 @@ export class ModelRegistry implements ModelAdminGateway {
 
     if (provider?.rerank) {
       try {
-        return await provider.rerank(request);
+        const response = await provider.rerank(request);
+        return {
+          ...response,
+          modelId: model.id,
+          provider: model.provider,
+        } as RerankResponse & { modelId: string; provider: string };
       } catch (error) {
         this.logger.warn('rerank provider failed, falling back', {
           modelId: model.id,
@@ -755,6 +961,19 @@ export class ModelRegistry implements ModelAdminGateway {
     if (!fallbackProvider?.rerank) {
       throw new Error('rule-based provider is unavailable');
     }
-    return fallbackProvider.rerank(request);
+    const fallbackResponse = await fallbackProvider.rerank(request);
+    if (model.provider !== 'rule-based') {
+      return {
+        ...fallbackResponse,
+        degraded: true,
+        modelId: model.id,
+        provider: model.provider,
+      } as RerankResponse & {
+        degraded: true;
+        modelId: string;
+        provider: string;
+      };
+    }
+    return fallbackResponse;
   }
 }

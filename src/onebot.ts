@@ -138,6 +138,19 @@ function buildEventId(payload: OneBotIncomingEvent): string {
   return hash.digest('hex');
 }
 
+/**
+ * 事件入库时间使用服务端接收时间，而不是协议端 payload.time：不同协议端/NTP
+ * 回拨会让时间戳倒退，摘要游标按 created_at 前进时就会永久跳过这些消息。
+ * 用单调递增的保护避免系统时钟回拨造成同样的倒退；上游原始时间仍保留在 raw 里。
+ */
+let lastReceivedMs = 0;
+function serverReceivedAt(): string {
+  const now = Date.now();
+  const stamp = now > lastReceivedMs ? now : lastReceivedMs;
+  lastReceivedMs = stamp;
+  return new Date(stamp).toISOString();
+}
+
 function toIsoTime(time?: number): string {
   if (typeof time === 'number' && Number.isFinite(time)) {
     return new Date(time * 1000).toISOString();
@@ -194,7 +207,7 @@ export function normalizeOneBotMessageEvent(
   return {
     id: buildEventId(payload),
     source: 'onebot-v11',
-    receivedAt: toIsoTime(payload.time),
+    receivedAt: serverReceivedAt(),
     botSelfId,
     scope,
     conversationId,

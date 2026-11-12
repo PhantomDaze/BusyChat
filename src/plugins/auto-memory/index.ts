@@ -51,6 +51,8 @@ interface AdminPreferences {
 interface AutoMemoryState {
   installedAt: string;
   lastSummaryDate: string;
+  /** 成功向全部管理员投递日报的日期，用于重启后的幂等保护。 */
+  lastSummarySentDate: string;
   messageBuffer: StoredMessage[];
   totalMessagesObserved: number;
   totalSummariesGenerated: number;
@@ -163,6 +165,7 @@ function createDefaultState(): AutoMemoryState {
   return {
     installedAt: nowIso(),
     lastSummaryDate: '',
+    lastSummarySentDate: '',
     messageBuffer: [],
     totalMessagesObserved: 0,
     totalSummariesGenerated: 0,
@@ -227,6 +230,8 @@ function normalizeState(value: JsonObject | undefined): AutoMemoryState {
   return {
     installedAt: readString(value.installedAt) ?? fallback.installedAt,
     lastSummaryDate: readString(value.lastSummaryDate) ?? fallback.lastSummaryDate,
+    lastSummarySentDate:
+      readString(value.lastSummarySentDate) ?? fallback.lastSummarySentDate,
     messageBuffer: readMessageBuffer(value.messageBuffer),
     totalMessagesObserved:
       typeof value.totalMessagesObserved === 'number'
@@ -262,6 +267,7 @@ function serializeState(state: AutoMemoryState): JsonObject {
   return {
     installedAt: state.installedAt,
     lastSummaryDate: state.lastSummaryDate,
+    lastSummarySentDate: state.lastSummarySentDate,
     messageBuffer: state.messageBuffer.map((m) => ({
       id: m.id,
       time: m.time,
@@ -378,6 +384,11 @@ function isRelevantToAdmin(
 // Daily summary
 // ---------------------------------------------------------------------------
 
+/** 今天的日报是否已经成功投递过（重启/重复触发时避免重复发送）。 */
+function summaryAlreadyDelivered(state: AutoMemoryState, date: string): boolean {
+  return state.lastSummarySentDate === date;
+}
+
 let summaryInFlight = false;
 
 async function runDailySummary(ctx: PluginContext): Promise<void> {
@@ -449,9 +460,11 @@ async function runDailySummaryInner(ctx: PluginContext): Promise<void> {
   if (reportMessages.length === 0) {
     ctx.logger.info('auto-memory: no messages to summarize today');
 
+    const dateStr = beijingDateString();
+    let deliveryOk = true;
+
     // Still send a quiet-day report
     if (adminIds.length > 0 && state.totalMessagesObserved > 0) {
-      const dateStr = beijingDateString();
       const quietReport = `📅 ${dateStr} 每日摘要\n\n今日无需要关注的消息。共收到 ${allMessages.length} 条消息。`;
 
       // Write to knowledge base
@@ -468,6 +481,7 @@ async function runDailySummaryInner(ctx: PluginContext): Promise<void> {
         try {
           await ctx.bot.sendPrivateMessage(uid, quietReport);
         } catch (err) {
+          deliveryOk = false;
           ctx.logger.warn('auto-memory: failed to send report', {
             recipient: uid,
             error: err instanceof Error ? err.message : String(err),
@@ -476,10 +490,19 @@ async function runDailySummaryInner(ctx: PluginContext): Promise<void> {
       }
     }
 
+    if (!deliveryOk) {
+      // 保留 lastSummaryDate/缓冲区，下一轮（重启或定时器）重试同一批消息。
+      ctx.logger.warn('auto-memory: quiet-day report delivery incomplete, keeping buffer for retry', {
+        date: dateStr,
+      });
+      return;
+    }
+
     // Clear the messages this run consumed, keeping any that arrived since
     await updateState(ctx, (current) => ({
       ...current,
-      lastSummaryDate: beijingDateString(),
+      lastSummaryDate: dateStr,
+      lastSummarySentDate: dateStr,
       messageBuffer: dropProcessed(current.messageBuffer),
     }));
     return;
@@ -589,10 +612,12 @@ async function runDailySummaryInner(ctx: PluginContext): Promise<void> {
     kbEntry ? `🧠 记忆ID: ${kbEntry.id.slice(0, 8)}` : '',
   ].join('\n');
 
+  let deliveryOk = true;
   for (const uid of recipients) {
     try {
       await ctx.bot.sendPrivateMessage(uid, reportMessage);
     } catch (err) {
+      deliveryOk = false;
       ctx.logger.warn('auto-memory: failed to send report', {
         recipient: uid,
         error: err instanceof Error ? err.message : String(err),
@@ -600,10 +625,21 @@ async function runDailySummaryInner(ctx: PluginContext): Promise<void> {
     }
   }
 
-  // Clear the messages this run consumed, keeping any that arrived since
+  if (!deliveryOk) {
+    // 投递失败时不要清空缓冲区、不要推进 lastSummaryDate，保证下一次能重试。
+    ctx.logger.warn('auto-memory: report delivery incomplete, keeping buffer for retry', {
+      date: dateStr,
+      recipients: recipients.length,
+    });
+    return;
+  }
+
+  // 全部投递成功后才消费这批消息；dropProcessed 只移除本次快照里的消息，
+  // 总结期间新到的消息继续留在缓冲区。
   await updateState(ctx, (current) => ({
     ...current,
     lastSummaryDate: dateStr,
+    lastSummarySentDate: dateStr,
     messageBuffer: dropProcessed(current.messageBuffer),
     totalSummariesGenerated: current.totalSummariesGenerated + 1,
   }));
@@ -752,7 +788,7 @@ function scheduleNextRun(ctx: PluginContext): void {
       try {
         const today = beijingDateString();
         const state = await readState(ctx);
-        if (state.lastSummaryDate !== today) {
+        if (!summaryAlreadyDelivered(state, today) && state.lastSummaryDate !== today) {
           ctx.logger.info('auto-memory: triggering daily summary', { date: today });
           await runDailySummary(ctx);
         }
@@ -783,7 +819,8 @@ function startTimer(ctx: PluginContext): void {
 
       if (
         (hour > SUMMARY_HOUR || (hour === SUMMARY_HOUR && minute >= SUMMARY_MINUTE)) &&
-        state.lastSummaryDate !== today
+        state.lastSummaryDate !== today &&
+        !summaryAlreadyDelivered(state, today)
       ) {
         ctx.logger.info('auto-memory: catch-up summary on startup', {
           time: `${hour}:${String(minute).padStart(2, '0')}`,

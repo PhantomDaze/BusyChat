@@ -21,6 +21,16 @@ interface KnowledgeServiceDependencies {
     appendKnowledgeEntry(entry: KnowledgeEntry): Promise<void>;
     listKnowledgeEntries(limit?: number): Promise<KnowledgeEntry[]>;
     listKnowledgeEntriesAfter(cursorId?: string, limit?: number): Promise<KnowledgeEntry[]>;
+    /**
+     * 可选：按 (created_at, id) 复合游标翻页，避免同一时间戳的条目被跳过。
+     * storage 层尚未实现时回退到 listKnowledgeEntriesAfter（旧行为）。
+     */
+    listKnowledgeEntriesAfterKey?(
+      cursor: { createdAt: string; id: string } | undefined,
+      limit?: number,
+    ): Promise<KnowledgeEntry[]>;
+    /** 可选：按 id 精确读取条目，供复合游标解析 createdAt。 */
+    getKnowledgeEntry?(id: string): Promise<KnowledgeEntry | null>;
     deleteKnowledgeEntry(id: string): Promise<string | false>;
   };
   models: ModelAdminGateway;
@@ -55,12 +65,25 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
+/** 运行时校验持久化/上游返回的向量：非数组、空数组、含非有限数字都视为无效。 */
+function isValidVector(value: unknown): value is number[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => typeof item === 'number' && Number.isFinite(item))
+  );
+}
+
 // ---------------------------------------------------------------------------
 // KnowledgeService
 // ---------------------------------------------------------------------------
 
 export class KnowledgeService implements KnowledgeServiceApi {
   private vectorIndex: Array<{ id: string; vector: number[] }> = [];
+  /** 未显式配置 vectorDimension 时，观察到的第一个向量维度。 */
+  private observedDimension: number | undefined;
+  /** 混合维度只告警一次，避免每次 add 都刷日志。 */
+  private dimensionWarned = false;
 
   constructor(private readonly deps: KnowledgeServiceDependencies) {}
 
@@ -80,9 +103,15 @@ export class KnowledgeService implements KnowledgeServiceApi {
     this.deps.appLogger.info('knowledge service stopped');
   }
 
-  async status(): Promise<KnowledgeBaseSettings> {
+  async status(): Promise<KnowledgeBaseSettings & { observedDimension?: number }> {
     const config = await this.deps.config.get();
-    return { ...config, enabled: await this.isEnabled() };
+    return {
+      ...config,
+      enabled: await this.isEnabled(),
+      ...(config.vectorDimension === undefined && this.observedDimension !== undefined
+        ? { observedDimension: this.observedDimension }
+        : {}),
+    };
   }
 
   /** 知识库开关 = builtin-knowledge 插件是否启用 */
@@ -112,6 +141,9 @@ export class KnowledgeService implements KnowledgeServiceApi {
     if (!vector || vector.length === 0) {
       throw new Error('embedding model returned empty vector');
     }
+    if (!isValidVector(vector)) {
+      throw new Error('embedding model returned non-numeric vector values');
+    }
     // Optional strict dimension check: a vector of the wrong width would be
     // stored but never match anything (cosineSimilarity returns 0 on length
     // mismatch), so fail loudly instead of persisting a dead entry.
@@ -121,6 +153,7 @@ export class KnowledgeService implements KnowledgeServiceApi {
         `embedding dimension mismatch: got ${vector.length}, expected ${expectedDim} (builtin-knowledge config)`,
       );
     }
+    this.recordVectorDimension(vector.length);
 
     const entry: KnowledgeEntry = {
       id: randomUUID(),
@@ -162,15 +195,17 @@ export class KnowledgeService implements KnowledgeServiceApi {
       source: 'knowledge-search',
     });
     const queryVector = response.vectors[0];
-    if (!queryVector || queryVector.length === 0) {
+    if (!queryVector || !isValidVector(queryVector)) {
       return [];
     }
 
-    // Step 2: Cosine similarity against all entries
-    const scored = this.vectorIndex.map((item) => ({
-      id: item.id,
-      score: cosineSimilarity(queryVector, item.vector),
-    }));
+    // Step 2: Cosine similarity against all entries. 单条坏向量（缺字段/空/
+    // 非数字）只跳过该条，不能让整个检索抛错。
+    const scored: Array<{ id: string; score: number }> = [];
+    for (const item of this.vectorIndex) {
+      if (!isValidVector(item.vector)) continue;
+      scored.push({ id: item.id, score: cosineSimilarity(queryVector, item.vector) });
+    }
     scored.sort((a, b) => b.score - a.score);
 
     // Step 3: Retrieve wider set for rerank
@@ -262,10 +297,45 @@ export class KnowledgeService implements KnowledgeServiceApi {
     cursorId?: string,
     limit?: number,
   ): Promise<KnowledgeEntry[]> {
-    return this.deps.storage.listKnowledgeEntriesAfter(
-      cursorId,
-      limit ?? 50,
+    const max = limit ?? 50;
+    const { storage } = this.deps;
+
+    if (!cursorId) {
+      return storage.listKnowledgeEntriesAfter(undefined, max);
+    }
+
+    // 优先使用 (created_at, id) 复合游标：仅按 created_at > cursor 比较会漏掉
+    // 与游标同一时间戳、但 id 更大的条目。
+    if (storage.listKnowledgeEntriesAfterKey) {
+      const cursorEntry = storage.getKnowledgeEntry
+        ? await storage.getKnowledgeEntry(cursorId)
+        : (await storage.listKnowledgeEntries()).find((entry) => entry.id === cursorId) ??
+          null;
+      if (!cursorEntry) return [];
+      return storage.listKnowledgeEntriesAfterKey(
+        { createdAt: cursorEntry.createdAt, id: cursorEntry.id },
+        max,
+      );
+    }
+
+    // 回退：存储层尚未提供复合游标时，从最近条目里补齐与游标同时间戳、
+    // 但 id 更大的条目，避免它们因为 `created_at > cursor` 被永久跳过。
+    const recent = await storage.listKnowledgeEntries();
+    const cursorEntry = recent.find((entry) => entry.id === cursorId);
+    const later = await storage.listKnowledgeEntriesAfter(cursorId, max);
+    if (!cursorEntry) return later;
+
+    const sameTimestamp = recent.filter(
+      (entry) => entry.createdAt === cursorEntry.createdAt && entry.id > cursorEntry.id,
     );
+    if (sameTimestamp.length === 0) return later;
+
+    return [...sameTimestamp, ...later]
+      .sort((a, b) => {
+        const byTime = a.createdAt.localeCompare(b.createdAt);
+        return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
+      })
+      .slice(0, max);
   }
 
   // -----------------------------------------------------------------------
@@ -355,12 +425,47 @@ export class KnowledgeService implements KnowledgeServiceApi {
   // Internal helpers
   // -----------------------------------------------------------------------
 
+  /**
+   * 记录向量维度：首个有效向量确定 observedDimension；之后出现不同维度时
+   * 只告警一次（通常意味着混用了不同 embedding 模型）。
+   */
+  private recordVectorDimension(dimension: number): void {
+    if (this.observedDimension === undefined) {
+      this.observedDimension = dimension;
+      return;
+    }
+    if (this.observedDimension !== dimension && !this.dimensionWarned) {
+      this.dimensionWarned = true;
+      this.deps.appLogger.warn('knowledge base has mixed embedding dimensions', {
+        observedDimension: this.observedDimension,
+        newDimension: dimension,
+      });
+    }
+  }
+
   private async rebuildIndex(): Promise<void> {
     const entries = await this.deps.storage.listKnowledgeEntries();
-    this.vectorIndex = entries.map((entry) => ({
-      id: entry.id,
-      vector: entry.vector,
-    }));
+    const next: Array<{ id: string; vector: number[] }> = [];
+    let skipped = 0;
+
+    for (const entry of entries) {
+      const vector = (entry as { vector?: unknown }).vector;
+      if (!isValidVector(vector)) {
+        // 缺向量/空向量/非数字向量：跳过而不是让整个索引重建失败。
+        skipped += 1;
+        continue;
+      }
+      next.push({ id: entry.id, vector });
+      this.recordVectorDimension(vector.length);
+    }
+
+    this.vectorIndex = next;
+    if (skipped > 0) {
+      this.deps.appLogger.warn('knowledge vector index skipped invalid entries', {
+        skipped,
+        indexed: next.length,
+      });
+    }
     this.deps.appLogger.debug('knowledge vector index rebuilt', {
       entries: this.vectorIndex.length,
     });

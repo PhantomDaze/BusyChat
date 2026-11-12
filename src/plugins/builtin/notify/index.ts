@@ -13,12 +13,60 @@ import type {
 interface NotifySettings {
   notifyKeywords: string[];
   quietHours: { start: string; end: string } | null;
+  /** 免打扰/每日摘要统一使用的 IANA 时区；默认 Asia/Shanghai */
+  timeZone: string;
 }
+
+const DEFAULT_TIME_ZONE = 'Asia/Shanghai';
 
 const DEFAULT_NOTIFY_CONFIG: NotifySettings = {
   notifyKeywords: [],
   quietHours: null,
+  timeZone: DEFAULT_TIME_ZONE,
 };
+
+/** 已校验过的时区集合，避免每条消息都构造一次 Intl.DateTimeFormat。 */
+const VALID_TIME_ZONES = new Set<string>([DEFAULT_TIME_ZONE]);
+
+/** 校验 IANA 时区；空值/非法值回落到 Asia/Shanghai。 */
+function normalizeTimeZone(value: unknown): string {
+  if (typeof value !== 'string') return DEFAULT_TIME_ZONE;
+  const candidate = value.trim();
+  if (!candidate) return DEFAULT_TIME_ZONE;
+  if (VALID_TIME_ZONES.has(candidate)) return candidate;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate });
+    VALID_TIME_ZONES.add(candidate);
+    return candidate;
+  } catch {
+    return DEFAULT_TIME_ZONE;
+  }
+}
+
+const TIME_ZONE_FORMATTERS = new Map<string, Intl.DateTimeFormat>();
+
+/** 读取指定时区当前的 HH:MM，避免混用 UTC 与宿主机本地时间。 */
+function zonedHourMinute(
+  timeZone: string,
+  at: Date = new Date(),
+): { hour: number; minute: number } {
+  let formatter = TIME_ZONE_FORMATTERS.get(timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    });
+    TIME_ZONE_FORMATTERS.set(timeZone, formatter);
+  }
+  const parts = formatter.formatToParts(at);
+  const read = (type: 'hour' | 'minute'): number => {
+    const found = parts.find((part) => part.type === type)?.value;
+    return found ? Number(found) : 0;
+  };
+  return { hour: read('hour'), minute: read('minute') };
+}
 
 /** 从 JsonObject 规范化配置，缺字段回落到默认值 */
 function readNotifyConfig(raw: JsonObject): NotifySettings {
@@ -33,7 +81,11 @@ function readNotifyConfig(raw: JsonObject): NotifySettings {
     const end = typeof q.end === 'string' ? q.end : null;
     if (start && end) quietHours = { start, end };
   }
-  return { notifyKeywords, quietHours };
+  return {
+    notifyKeywords,
+    quietHours,
+    timeZone: normalizeTimeZone(raw.timeZone),
+  };
 }
 
 function parseHhmm(value: string): number | null {
@@ -83,6 +135,7 @@ export function createNotifyPlugin(services: AppServices): BotPlugin {
             return {
               notifyKeywords: cfg.notifyKeywords,
               quietHours: cfg.quietHours,
+              timeZone: cfg.timeZone,
             } as unknown as JsonObject;
           },
         });
@@ -90,7 +143,11 @@ export function createNotifyPlugin(services: AppServices): BotPlugin {
           method: 'POST',
           path: '/api/notify/settings',
           handler: async (payload) => {
-            const p = payload as { notifyKeywords?: unknown; quietHours?: unknown };
+            const p = payload as {
+              notifyKeywords?: unknown;
+              quietHours?: unknown;
+              timeZone?: unknown;
+            };
             await ctx.config.update((state) => {
               const next = { ...state };
               if (Array.isArray(p.notifyKeywords)) {
@@ -108,6 +165,10 @@ export function createNotifyPlugin(services: AppServices): BotPlugin {
                 if (start && end && start !== end) {
                   next.quietHours = { start, end };
                 }
+              }
+              if (p.timeZone !== undefined) {
+                // 非法时区统一回落到默认值，避免静默使用宿主机时区。
+                next.timeZone = normalizeTimeZone(p.timeZone);
               }
               return next;
             });
@@ -202,8 +263,8 @@ export function createNotifyPlugin(services: AppServices): BotPlugin {
         const qh = cfg.quietHours;
         let inQuiet = false;
         if (qh) {
-          const now = new Date();
-          inQuiet = isWithinQuietHours(now.getHours() * 60 + now.getMinutes(), qh.start, qh.end);
+          const now = zonedHourMinute(cfg.timeZone);
+          inQuiet = isWithinQuietHours(now.hour * 60 + now.minute, qh.start, qh.end);
         }
 
         if (inQuiet) return;

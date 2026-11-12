@@ -14,6 +14,13 @@ import type {
   SummarySettings,
 } from './types';
 
+interface SummaryDegradedState {
+  at: string;
+  reason: string;
+  modelId?: string;
+  provider?: string;
+}
+
 interface SummaryWorkerDependencies {
   runtime: AppServices['runtime'];
   storage: AppServices['storage'];
@@ -211,12 +218,18 @@ async function getActiveModelId(services: SummaryWorkerDependencies, task: Model
 
 export class SummaryWorker {
   private timer: NodeJS.Timeout | null = null;
-  private flushing = false;
+  /** 在途 flush；同一时间只允许一个，避免重叠定时器/手动触发重复总结。 */
+  private inFlight: Promise<SummaryRecord | null> | null = null;
+  private lastFlushAt: string | undefined;
+  private lastError: string | undefined;
+  private degradedState: SummaryDegradedState | null = null;
 
   constructor(private readonly deps: SummaryWorkerDependencies) {}
 
   async start(): Promise<void> {
-    await this.stop();
+    // 只清理定时器，不等待在途 flush —— 手动 flush 末尾会调用 start()，
+    // 若这里等待自身会一直卡到 10 秒超时。
+    this.clearTimer();
     const [runtime, cfg] = await Promise.all([
       this.deps.runtime.snapshot(),
       this.deps.config.get(),
@@ -246,11 +259,29 @@ export class SummaryWorker {
     });
   }
 
-  async stop(): Promise<void> {
+  private clearTimer(): void {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  async stop(): Promise<void> {
+    this.clearTimer();
+
+    const inFlight = this.inFlight;
+    if (!inFlight) return;
+    // 停止时给在途批次最多 10 秒完成，避免把半成品摘要留在后台线程里。
+    await Promise.race([
+      inFlight.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, 10_000);
+        timeout.unref?.();
+      }),
+    ]);
   }
 
   async status(): Promise<{
@@ -260,6 +291,10 @@ export class SummaryWorker {
     maxEventsPerPrompt: number;
     cursorEventId: string | undefined;
     lastGeneratedAt: string | undefined;
+    degraded: SummaryDegradedState | null;
+    lastError: string | undefined;
+    lastFlushAt: string | undefined;
+    inFlight: boolean;
   }> {
     const cfg = await this.deps.config.get();
     return {
@@ -269,6 +304,10 @@ export class SummaryWorker {
       maxEventsPerPrompt: cfg.maxEventsPerPrompt,
       cursorEventId: cfg.cursorEventId,
       lastGeneratedAt: cfg.lastGeneratedAt,
+      degraded: this.degradedState,
+      lastError: this.lastError,
+      lastFlushAt: this.lastFlushAt,
+      inFlight: this.inFlight !== null,
     };
   }
 
@@ -276,15 +315,28 @@ export class SummaryWorker {
     // Serialize flushes: an interval tick firing while a previous flush is still
     // awaiting the model would otherwise read the same cursor, produce a
     // duplicate summary, and race on the cursor write.
-    if (this.flushing) {
+    if (this.inFlight) {
       this.deps.appLogger.debug('summary flush skipped: already in progress', { reason });
       return null;
     }
-    this.flushing = true;
+
+    const run = (async (): Promise<SummaryRecord | null> => {
+      try {
+        return await this.flushInner(reason);
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : String(error);
+        throw error;
+      } finally {
+        this.lastFlushAt = nowIso();
+      }
+    })();
+    this.inFlight = run;
     try {
-      return await this.flushInner(reason);
+      return await run;
     } finally {
-      this.flushing = false;
+      if (this.inFlight === run) {
+        this.inFlight = null;
+      }
     }
   }
 
@@ -373,7 +425,29 @@ export class SummaryWorker {
       recipients,
       eventCount: generationContext.events.length,
     });
+
+    // 真实模型失败后 ModelRegistry 会返回 rule-based 兜底并置 degraded。
+    // 这种批次不落正式摘要、不推进游标，等下一个周期重试同一批事件。
+    if (textResult.degraded === true) {
+      const reasonText = `summary model degraded (modelId=${textResult.modelId ?? 'unknown'}, provider=${textResult.provider ?? 'unknown'})`;
+      this.degradedState = {
+        at: nowIso(),
+        reason: reasonText,
+        ...(textResult.modelId ? { modelId: textResult.modelId } : {}),
+        ...(textResult.provider ? { provider: textResult.provider } : {}),
+      };
+      this.lastError = reasonText;
+      this.deps.appLogger.warn('summary flush degraded: keeping cursor for retry', {
+        reason,
+        modelId: textResult.modelId ?? '(unknown)',
+        provider: textResult.provider ?? '(unknown)',
+      });
+      return null;
+    }
+
     const parsed = parseSummaryOutput(textResult.text);
+    // 未配置真实模型时规则兜底是预期行为，保留占位摘要但在记录里显式标记。
+    const isPlaceholder = textResult.provider === 'rule-based';
     const summaryRecord: SummaryRecord = {
       id: makeId('summary'),
       createdAt: nowIso(),
@@ -381,35 +455,30 @@ export class SummaryWorker {
       sourceEventIds: limitedEvents.map((event) => event.id),
       excludedEventIds: excludedEvents.map((event) => event.id),
       recipientIds: recipients,
-      modelId: await getActiveModelId(this.deps, 'summary'),
+      modelId: textResult.modelId ?? (await getActiveModelId(this.deps, 'summary')),
       summaryText: parsed.summaryText,
       suggestionsText: parsed.suggestionsText || '暂无建议。',
       metadata: {
         reason,
         eventCount: limitedEvents.length,
         reportableCount: reportableEvents.length,
+        ...(isPlaceholder ? { placeholder: true, provider: 'rule-based' } : {}),
       },
     };
 
-    await this.deps.storage.appendSummary(summaryRecord);
-    await this.deps.config.update((current) => ({
-      ...current,
-      cursorEventId: lastEvent.id,
-      lastGeneratedAt: summaryRecord.createdAt,
-    }));
-
+    // 先投递，再落库并推进游标：任何一位管理员投递失败都保留整批等待重试。
     const pendingSection = this.deps.replyFormatter ? this.deps.replyFormatter() : '';
     const fullText = `摘要：\n${summaryRecord.summaryText}\n\n建议：\n${summaryRecord.suggestionsText}${pendingSection}`;
     const chunks = chunkWithPrefixBudget(fullText);
+    const failedRecipients: string[] = [];
     for (const recipientId of recipients) {
-      // Isolate per recipient: one unreachable admin must not abort delivery to
-      // the others (the cursor has already advanced, so an abort would lose it).
       try {
         for (let i = 0; i < chunks.length; i += 1) {
           const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
           await this.deps.bot.sendPrivateMessage(recipientId, prefix + chunks[i]!);
         }
       } catch (error) {
+        failedRecipients.push(recipientId);
         this.deps.appLogger.warn('summary delivery failed for recipient', {
           recipientId,
           summaryId: summaryRecord.id,
@@ -418,7 +487,37 @@ export class SummaryWorker {
       }
     }
 
-    await this.deps.plugins.dispatchSummary(summaryRecord);
+    if (failedRecipients.length > 0) {
+      // 不追加摘要、不推进游标；下一轮会重试整批（已成功的收件人可能收到重复）。
+      const errorText = `summary delivery failed for ${failedRecipients.length}/${recipients.length} recipients: ${failedRecipients.join(', ')}`;
+      this.lastError = errorText;
+      this.deps.appLogger.warn('summary flush incomplete: cursor not advanced', {
+        reason,
+        failedRecipients,
+        summaryId: summaryRecord.id,
+      });
+      return null;
+    }
+
+    await this.deps.storage.appendSummary(summaryRecord);
+    await this.deps.config.update((current) => ({
+      ...current,
+      cursorEventId: lastEvent.id,
+      lastGeneratedAt: summaryRecord.createdAt,
+    }));
+    this.degradedState = null;
+    this.lastError = undefined;
+
+    // 摘要已经落库并投递成功，插件分发失败不应回头重放整批。
+    try {
+      await this.deps.plugins.dispatchSummary(summaryRecord);
+    } catch (error) {
+      this.deps.appLogger.warn('summary dispatch failed after persistence', {
+        summaryId: summaryRecord.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     this.deps.appLogger.info('summary sent', {
       reason,
       recipients,
