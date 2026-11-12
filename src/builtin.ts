@@ -147,10 +147,14 @@ export async function registerBuiltinPlugins(
         ctx.webui.register({
           method: 'DELETE',
           path: '/api/knowledge/{id}',
-          handler: async (payload) => {
-            // id 从路径参数取，这里 fallback payload
-            const id = typeof (payload as { id?: string })?.id === 'string' ? (payload as { id: string }).id : '';
-            const deleted = await knowledge.delete(id);
+          handler: async (payload, query) => {
+            // id 优先从路径参数（query.id）取，兼容带 body 的旧调用
+            const fromQuery = typeof query.id === 'string' ? query.id : '';
+            const fromPayload =
+              typeof (payload as { id?: string } | undefined)?.id === 'string'
+                ? ((payload as { id: string }).id)
+                : '';
+            const deleted = await knowledge.delete(fromQuery || fromPayload);
             return { deleted } as unknown as JsonObject;
           },
         });

@@ -30,6 +30,7 @@ import type {
   WebUiRouteRegistrar,
 } from './types';
 import { createPluginConfigStore } from './plugin-config';
+import { redactRuntime } from './security';
 
 interface PluginManagerDependencies {
   runtime: RuntimeStore;
@@ -55,7 +56,33 @@ interface LoadedPlugin {
   context: PluginContext;
   filePath: string;
   enabled: boolean;
+  /** 最近一次热重载失败的原因（旧版本仍在服务） */
+  lastError?: string;
 }
+
+/** 加载失败、未进入 loaded 的插件，供 list()/status 展示错误。 */
+interface PluginFailure {
+  manifest: PluginManifest;
+  filePath: string;
+  error: string;
+}
+
+/**
+ * setup 期间注册项先写入暂存区，setup 成功后再原子提交；
+ * 失败时旧版本的路由/命令保持不动。
+ */
+interface RegistrarStage {
+  live: boolean;
+  routes: WebUiRouteEntry[];
+  commands: CommandDefinition[];
+}
+
+function createRegistrarStage(): RegistrarStage {
+  return { live: false, routes: [], commands: [] };
+}
+
+/** 插件名规则：小写字母/数字开头，仅允许小写字母、数字、点、下划线、连字符，最长 64。 */
+const PLUGIN_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 interface PluginEntrypointCandidate {
   filePath: string;
@@ -71,7 +98,17 @@ interface PluginManagerApi {
   dispatchMessage(event: NormalizedMessageEvent): Promise<void>;
   dispatchSummary(summary: SummaryRecord): Promise<void>;
   dispatchAdvice(advice: AdviceRecord): Promise<void>;
-  list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined; filePath?: string }>>;
+  list(): Promise<
+    Array<{
+      name: string;
+      version: string;
+      enabled: boolean;
+      description: string | undefined;
+      permissions: PluginPermission[];
+      filePath?: string;
+      error?: string;
+    }>
+  >;
   setEnabled(name: string, enabled: boolean): Promise<void>;
   listLoadedManifestNames(): Promise<string[]>;
   /** 插件注册的 WebUI 路由（供 WebUI 服务器挂载） */
@@ -209,7 +246,8 @@ function createNamespacedStorage(storage: NamespacedStorage, permissions: Set<Pl
 
 function createReadOnlyRuntime(runtime: RuntimeStore): PluginRuntimeReader {
   return {
-    snapshot: () => runtime.snapshot(),
+    // 插件只应看到脱敏后的运行时快照：凭据（密码/令牌/API Key）一律替换为标记。
+    snapshot: async () => redactRuntime(await runtime.snapshot()),
   };
 }
 
@@ -311,8 +349,8 @@ function createPluginContext(
   plugin: BotPlugin,
   base: PluginManagerDependencies,
   logger: Logger,
-  webUiRoutes: WebUiRouteEntry[],
-  manifestToRoutes: Map<string, WebUiRouteEntry[]>,
+  stage: RegistrarStage,
+  addRoute: (entry: WebUiRouteEntry) => void,
 ): PluginContext {
   const permissions = permissionSet(plugin.manifest);
   const storage = createNamespacedStorage(base.storage.namespace(plugin.manifest.name), permissions);
@@ -330,10 +368,13 @@ function createPluginContext(
       if (!permissions.has('command:register')) {
         throw new Error('plugin lacks command:register permission');
       }
-      base.commands.register({
+      const entry: CommandDefinition = {
         ...command,
         owner: plugin.manifest.name,
-      });
+      };
+      // setup 阶段先暂存；提交后（live）再直接注册。
+      if (stage.live) base.commands.register(entry);
+      else stage.commands.push(entry);
     },
   };
 
@@ -351,13 +392,8 @@ function createPluginContext(
     ? {
         register(route: WebUiRouteHandler): void {
           const entry: WebUiRouteEntry = { ...route, owner: plugin.manifest.name };
-          webUiRoutes.push(entry);
-          let list = manifestToRoutes.get(plugin.manifest.name);
-          if (!list) {
-            list = [];
-            manifestToRoutes.set(plugin.manifest.name, list);
-          }
-          list.push(entry);
+          if (stage.live) addRoute(entry);
+          else stage.routes.push(entry);
         },
       }
     : undefined;
@@ -381,11 +417,14 @@ function createPluginContext(
 
 export class PluginManager implements PluginManagerApi {
   private readonly loaded = new Map<string, LoadedPlugin>();
+  private readonly failures = new Map<string, PluginFailure>();
   private readonly webUiRoutes: WebUiRouteEntry[] = [];
   private readonly manifestToRoutes = new Map<string, WebUiRouteEntry[]>();
   private readonly builtins: BotPlugin[] = [];
   private watcher: import('node:fs').FSWatcher | null = null;
   private reloadTimer: NodeJS.Timeout | null = null;
+  /** 串行化 reload/reloadOne/setEnabled，避免文件监听与 API 触发的重载交错。 */
+  private operationChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly deps: PluginManagerDependencies) {}
 
@@ -394,38 +433,175 @@ export class PluginManager implements PluginManagerApi {
     this.builtins.push(plugin);
   }
 
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.operationChain.then(operation, operation);
+    // 队列本身吞掉错误，保证后续操作不会被前一次的失败卡住。
+    this.operationChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   async load(): Promise<void> {
-    await this.reload();
-    this.startWatching();
+    await this.enqueue(async () => {
+      await this.reloadInternal();
+      this.startWatching();
+    });
   }
 
   async reload(): Promise<void> {
-    await this.shutdown();
+    await this.enqueue(() => this.reloadInternal());
+  }
+
+  async reloadOne(name: string): Promise<void> {
+    await this.enqueue(() => this.reloadOneInternal(name));
+  }
+
+  async setEnabled(name: string, enabled: boolean): Promise<void> {
+    await this.enqueue(async () => {
+      await this.deps.runtime.update((state) => {
+        if (!state.plugins[name]) {
+          state.plugins[name] = { enabled };
+        } else {
+          state.plugins[name].enabled = enabled;
+        }
+      });
+      await this.reloadInternal();
+    });
+  }
+
+  async shutdown(): Promise<void> {
+    await this.enqueue(() => this.shutdownInternal());
+  }
+
+  // -----------------------------------------------------------------------
+  // 注册项提交 / 回滚
+  // -----------------------------------------------------------------------
+
+  private addRoute(entry: WebUiRouteEntry): void {
+    this.webUiRoutes.push(entry);
+    let list = this.manifestToRoutes.get(entry.owner);
+    if (!list) {
+      list = [];
+      this.manifestToRoutes.set(entry.owner, list);
+    }
+    list.push(entry);
+  }
+
+  /**
+   * setup 成功后原子提交暂存注册：先移除旧版本的同名命令/路由，再安装新版本，
+   * 之后插件运行期再注册的项会直接进入 live 状态。
+   */
+  private commitRegistrations(name: string, stage: RegistrarStage): void {
+    this.deps.commands.unregisterOwner(name);
+    for (const command of stage.commands) {
+      this.deps.commands.register(command);
+    }
+    this.removeRoutesForOwner(name);
+    for (const route of stage.routes) {
+      this.addRoute(route);
+    }
+    stage.commands.length = 0;
+    stage.routes.length = 0;
+    stage.live = true;
+  }
+
+  private removeRoutesForOwner(name: string): void {
+    const routes = this.manifestToRoutes.get(name);
+    if (!routes) return;
+    for (const r of routes) {
+      const idx = this.webUiRoutes.indexOf(r);
+      if (idx >= 0) this.webUiRoutes.splice(idx, 1);
+    }
+    this.manifestToRoutes.delete(name);
+  }
+
+  /** 校验插件名格式，并阻止文件插件冒充已注册的内置插件。 */
+  private assertManifestName(
+    manifest: PluginManifest,
+    builtinNames: Set<string>,
+    isBuiltin: boolean,
+  ): void {
+    if (typeof manifest.name !== 'string' || !PLUGIN_NAME_PATTERN.test(manifest.name)) {
+      throw new Error(
+        `invalid plugin name ${JSON.stringify(manifest.name ?? '')}: must match ${PLUGIN_NAME_PATTERN}`,
+      );
+    }
+    if (!isBuiltin && builtinNames.has(manifest.name)) {
+      throw new Error(`plugin "${manifest.name}" collides with a registered builtin plugin`);
+    }
+  }
+
+  private recordFailure(manifest: PluginManifest, filePath: string, error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    this.failures.set(manifest.name, { manifest, filePath, error: message });
+    return message;
+  }
+
+  private async runTeardown(name: string, record: LoadedPlugin): Promise<void> {
+    const teardowns: Array<() => unknown> = [];
+    if (record.plugin.hooks?.onShutdown) {
+      teardowns.push(() => record.plugin.hooks!.onShutdown!(record.context));
+    }
+    if (record.plugin.teardown) {
+      teardowns.push(() => record.plugin.teardown!(record.context));
+    }
+    for (const run of teardowns) {
+      try {
+        await run();
+      } catch (error) {
+        this.deps.appLogger.warn('plugin teardown failed', {
+          plugin: name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // 加载 / 重载
+  // -----------------------------------------------------------------------
+
+  private async reloadInternal(): Promise<void> {
+    await this.teardownAll();
 
     const runtime = await this.deps.runtime.snapshot();
     const nextPlugins = { ...runtime.plugins };
+    const builtinNames = new Set(this.builtins.map((plugin) => plugin.manifest.name));
 
     // 先加载内置插件
     for (const plugin of this.builtins) {
       const name = plugin.manifest.name;
-      const pluginState =
-        nextPlugins[name] ?? (nextPlugins[name] = { enabled: true });
-      const logger = this.deps.appLogger.child(`plugin:${name}`);
-      const context = createPluginContext(plugin, this.deps, logger, this.webUiRoutes, this.manifestToRoutes);
+      try {
+        this.assertManifestName(plugin.manifest, builtinNames, true);
+      } catch (error) {
+        const message = this.recordFailure(plugin.manifest, '(builtin)', error);
+        this.deps.appLogger.error('failed to load builtin plugin', { name, error: message });
+        continue;
+      }
+
+      const pluginState = nextPlugins[name] ?? (nextPlugins[name] = { enabled: true });
       const enabled = pluginState.enabled !== false;
+      const logger = this.deps.appLogger.child(`plugin:${name}`);
+      const stage = createRegistrarStage();
+      const context = createPluginContext(plugin, this.deps, logger, stage, (entry) =>
+        this.addRoute(entry),
+      );
+
       if (enabled) {
         try {
           await plugin.setup(context);
+          // setup 成功后才提交注册并标记为已加载。
+          this.commitRegistrations(name, stage);
           logger.info('builtin plugin loaded', { version: plugin.manifest.version });
         } catch (error) {
-          this.deps.commands.unregisterOwner(name);
-          this.removeRoutesForOwner(name);
-          this.deps.appLogger.error('failed to load builtin plugin', {
-            name,
-            error: error instanceof Error ? error.message : String(error),
-          });
+          const message = this.recordFailure(plugin.manifest, '(builtin)', error);
+          this.deps.appLogger.error('failed to load builtin plugin', { name, error: message });
+          continue;
         }
       }
+
       this.loaded.set(name, {
         manifest: plugin.manifest,
         plugin,
@@ -439,10 +615,12 @@ export class PluginManager implements PluginManagerApi {
     const entrypoints = await discoverPluginEntrypoints(this.deps.pluginSearchDirs);
 
     for (const filePath of entrypoints) {
+      let plugin: BotPlugin | null = null;
+      let stage: RegistrarStage | undefined;
       try {
         const importUrl = `${pathToFileURL(filePath).href}?v=${Date.now()}`;
         const mod = (await dynamicImport(importUrl)) as PluginModule;
-        const plugin = mod.createPlugin ? unwrapPluginCandidate(await mod.createPlugin()) : resolvePluginModule(mod);
+        plugin = mod.createPlugin ? unwrapPluginCandidate(await mod.createPlugin()) : resolvePluginModule(mod);
         if (!plugin) {
           this.deps.appLogger.warn('plugin module did not export a plugin', { filePath });
           continue;
@@ -451,30 +629,30 @@ export class PluginManager implements PluginManagerApi {
         if (!plugin.manifest?.name) {
           throw new Error('plugin manifest.name is required');
         }
+        this.assertManifestName(plugin.manifest, builtinNames, false);
 
+        const name = plugin.manifest.name;
         const pluginState =
-          nextPlugins[plugin.manifest.name] ??
-          (nextPlugins[plugin.manifest.name] = {
+          nextPlugins[name] ??
+          (nextPlugins[name] = {
             enabled: true,
           });
-        const logger = this.deps.appLogger.child(`plugin:${plugin.manifest.name}`);
-        const context = createPluginContext(plugin, this.deps, logger, this.webUiRoutes, this.manifestToRoutes);
+        const logger = this.deps.appLogger.child(`plugin:${name}`);
+        stage = createRegistrarStage();
+        const context = createPluginContext(plugin, this.deps, logger, stage, (entry) =>
+          this.addRoute(entry),
+        );
         const enabled = pluginState.enabled !== false;
 
         if (enabled) {
-          try {
-            await plugin.setup(context);
-          } catch (error) {
-            this.deps.commands.unregisterOwner(plugin.manifest.name);
-            this.removeRoutesForOwner(plugin.manifest.name);
-            throw error;
-          }
+          await plugin.setup(context);
+          this.commitRegistrations(name, stage);
           logger.info('plugin loaded', { version: plugin.manifest.version, filePath });
         } else {
           logger.info('plugin discovered but disabled', { version: plugin.manifest.version, filePath });
         }
 
-        this.loaded.set(plugin.manifest.name, {
+        this.loaded.set(name, {
           manifest: plugin.manifest,
           plugin,
           context,
@@ -482,10 +660,20 @@ export class PluginManager implements PluginManagerApi {
           enabled,
         });
       } catch (error) {
-        this.deps.appLogger.error('failed to load plugin', {
-          filePath,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        const message = error instanceof Error ? error.message : String(error);
+        this.deps.appLogger.error('failed to load plugin', { filePath, error: message });
+        // setup 抛错或清单非法：不进入 loaded，但把错误暴露给 list()/status。
+        if (stage) {
+          stage.commands.length = 0;
+          stage.routes.length = 0;
+        }
+        if (plugin?.manifest && typeof plugin.manifest.name === 'string') {
+          this.failures.set(plugin.manifest.name, {
+            manifest: plugin.manifest,
+            filePath,
+            error: message,
+          });
+        }
       }
     }
 
@@ -494,31 +682,7 @@ export class PluginManager implements PluginManagerApi {
     });
   }
 
-  async reloadOne(name: string): Promise<void> {
-    const record = this.loaded.get(name);
-    if (record) {
-      this.deps.commands.unregisterOwner(name);
-      this.removeRoutesForOwner(name);
-      const teardowns: Array<() => unknown> = [];
-      if (record.plugin.hooks?.onShutdown) {
-        teardowns.push(() => record.plugin.hooks!.onShutdown!(record.context));
-      }
-      if (record.plugin.teardown) {
-        teardowns.push(() => record.plugin.teardown!(record.context));
-      }
-      for (const run of teardowns) {
-        try {
-          await run();
-        } catch (error) {
-          this.deps.appLogger.warn('plugin teardown failed', {
-            plugin: name,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-      this.loaded.delete(name);
-    }
-
+  private async reloadOneInternal(name: string): Promise<void> {
     const entrypoints = await discoverPluginEntrypoints(this.deps.pluginSearchDirs);
     const targetEntry = entrypoints.find((filePath) => {
       const segments = filePath.split(path.sep);
@@ -530,7 +694,6 @@ export class PluginManager implements PluginManagerApi {
     }
 
     const runtime = await this.deps.runtime.snapshot();
-    const pluginState = runtime.plugins[name] ?? { enabled: true };
     const importUrl = `${pathToFileURL(targetEntry).href}?v=${Date.now()}`;
     const mod = (await dynamicImport(importUrl)) as PluginModule;
     const plugin = mod.createPlugin ? unwrapPluginCandidate(await mod.createPlugin()) : resolvePluginModule(mod);
@@ -540,41 +703,88 @@ export class PluginManager implements PluginManagerApi {
     if (!plugin.manifest?.name) {
       throw new Error('plugin manifest.name is required');
     }
-    const logger = this.deps.appLogger.child(`plugin:${plugin.manifest.name}`);
-    const context = createPluginContext(plugin, this.deps, logger, this.webUiRoutes, this.manifestToRoutes);
+    const builtinNames = new Set(this.builtins.map((builtin) => builtin.manifest.name));
+    this.assertManifestName(plugin.manifest, builtinNames, false);
+
+    const resolvedName = plugin.manifest.name;
+    const pluginState = runtime.plugins[resolvedName] ?? runtime.plugins[name] ?? { enabled: true };
     const enabled = pluginState.enabled !== false;
+    const logger = this.deps.appLogger.child(`plugin:${resolvedName}`);
+    const stage = createRegistrarStage();
+    const context = createPluginContext(plugin, this.deps, logger, stage, (entry) =>
+      this.addRoute(entry),
+    );
+    const previous = this.loaded.get(resolvedName);
+
     if (enabled) {
       try {
         await plugin.setup(context);
       } catch (error) {
-        this.deps.commands.unregisterOwner(plugin.manifest.name);
-        this.removeRoutesForOwner(plugin.manifest.name);
+        // setup 失败：保留旧版本继续服务，只记录错误。
+        const message = error instanceof Error ? error.message : String(error);
+        this.deps.appLogger.error('failed to reload plugin', {
+          plugin: resolvedName,
+          filePath: targetEntry,
+          error: message,
+        });
+        if (previous) previous.lastError = message;
+        else {
+          this.failures.set(resolvedName, {
+            manifest: plugin.manifest,
+            filePath: targetEntry,
+            error: message,
+          });
+        }
         throw error;
       }
+      this.commitRegistrations(resolvedName, stage);
       logger.info('plugin reloaded', { version: plugin.manifest.version, filePath: targetEntry });
+    } else {
+      // 已禁用：移除旧版本的命令与路由。
+      this.deps.commands.unregisterOwner(resolvedName);
+      this.removeRoutesForOwner(resolvedName);
     }
-    this.loaded.set(plugin.manifest.name, {
+
+    // 新版本就绪后再销毁旧版本，避免失败时出现空窗。
+    if (previous) {
+      await this.runTeardown(resolvedName, previous);
+    }
+
+    this.loaded.set(resolvedName, {
       manifest: plugin.manifest,
       plugin,
       context,
       filePath: targetEntry,
       enabled,
     });
+    this.failures.delete(resolvedName);
   }
 
-  private removeRoutesForOwner(name: string): void {
-    const routes = this.manifestToRoutes.get(name);
-    if (!routes) return;
-    for (const r of routes) {
-      const idx = this.webUiRoutes.indexOf(r);
-      if (idx >= 0) this.webUiRoutes.splice(idx, 1);
+  private async teardownAll(): Promise<void> {
+    for (const [name, record] of this.loaded.entries()) {
+      this.deps.commands.unregisterOwner(name);
+      this.removeRoutesForOwner(name);
+      await this.runTeardown(name, record);
     }
-    this.manifestToRoutes.delete(name);
+    this.loaded.clear();
+    this.failures.clear();
+    this.webUiRoutes.length = 0;
+    this.manifestToRoutes.clear();
+  }
+
+  private async shutdownInternal(): Promise<void> {
+    this.stopWatching();
+    await this.teardownAll();
   }
 
   collectWebUiRoutes(): Array<{ owner: string; route: WebUiRouteHandler }> {
-    return this.webUiRoutes.map((entry) => ({ owner: entry.owner, route: { ...entry, owner: undefined } as WebUiRouteHandler }));
+    // 每次调用都返回当前实时路由，禁用/卸载后立即不再出现。
+    return this.webUiRoutes.map(({ owner, ...route }) => ({ owner, route }));
   }
+
+  // -----------------------------------------------------------------------
+  // 文件监听
+  // -----------------------------------------------------------------------
 
   private startWatching(): void {
     if (this.watcher) return;
@@ -643,33 +853,9 @@ export class PluginManager implements PluginManagerApi {
     }
   }
 
-  async shutdown(): Promise<void> {
-    this.stopWatching();
-    for (const [name, record] of this.loaded.entries()) {
-      this.deps.commands.unregisterOwner(name);
-      this.removeRoutesForOwner(name);
-      const teardowns: Array<() => unknown> = [];
-      if (record.plugin.hooks?.onShutdown) {
-        teardowns.push(() => record.plugin.hooks!.onShutdown!(record.context));
-      }
-      if (record.plugin.teardown) {
-        teardowns.push(() => record.plugin.teardown!(record.context));
-      }
-      for (const run of teardowns) {
-        try {
-          await run();
-        } catch (error) {
-          this.deps.appLogger.warn('plugin teardown failed', {
-            plugin: name,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-    }
-    this.loaded.clear();
-    this.webUiRoutes.length = 0;
-    this.manifestToRoutes.clear();
-  }
+  // -----------------------------------------------------------------------
+  // 事件分发
+  // -----------------------------------------------------------------------
 
   async dispatchMessage(event: NormalizedMessageEvent): Promise<void> {
     const tasks: Promise<unknown>[] = [];
@@ -757,30 +943,62 @@ export class PluginManager implements PluginManagerApi {
     await Promise.all(tasks);
   }
 
-  async list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined; filePath?: string }>> {
+  async list(): Promise<
+    Array<{
+      name: string;
+      version: string;
+      enabled: boolean;
+      description: string | undefined;
+      permissions: PluginPermission[];
+      filePath?: string;
+      error?: string;
+    }>
+  > {
     const runtime = await this.deps.runtime.snapshot();
-    return [...this.loaded.values()]
-      .map((record) => ({
+    const entries: Array<{
+      name: string;
+      version: string;
+      enabled: boolean;
+      description: string | undefined;
+      permissions: PluginPermission[];
+      filePath?: string;
+      error?: string;
+    }> = [...this.loaded.values()].map((record) => {
+      const entry: {
+        name: string;
+        version: string;
+        enabled: boolean;
+        description: string | undefined;
+        permissions: PluginPermission[];
+        filePath?: string;
+        error?: string;
+      } = {
         name: record.manifest.name,
         version: record.manifest.version,
         enabled: runtime.plugins[record.manifest.name]?.enabled !== false && record.enabled,
         description: record.manifest.description,
+        permissions: [...record.manifest.permissions],
         filePath: record.filePath,
-      }))
-      .sort((left, right) => left.name.localeCompare(right.name));
-  }
-
-  async setEnabled(name: string, enabled: boolean): Promise<void> {
-    await this.deps.runtime.update((state) => {
-      if (!state.plugins[name]) {
-        state.plugins[name] = {
-          enabled,
-        };
-      } else {
-        state.plugins[name].enabled = enabled;
-      }
+      };
+      if (record.lastError !== undefined) entry.error = record.lastError;
+      return entry;
     });
-    await this.reload();
+
+    // 加载失败、未进入 loaded 的插件也展示出来（enabled=false + error）。
+    for (const [name, failure] of this.failures) {
+      if (this.loaded.has(name)) continue;
+      entries.push({
+        name,
+        version: failure.manifest.version,
+        enabled: false,
+        description: failure.manifest.description,
+        permissions: [...failure.manifest.permissions],
+        filePath: failure.filePath,
+        error: failure.error,
+      });
+    }
+
+    return entries.sort((left, right) => left.name.localeCompare(right.name));
   }
 
   async listLoadedManifestNames(): Promise<string[]> {
