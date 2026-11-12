@@ -63,7 +63,7 @@ The default runtime should work out of the box with:
 
 - file storage
 - rule-based fallback models
-- a basic WebUI
+- a self-contained WebUI
 - at least one sample plugin
 
 ## 9. Keep configuration in JSON

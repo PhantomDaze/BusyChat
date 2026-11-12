@@ -151,4 +151,4 @@ The following units are safe to extract later if scale demands it:
 - file-backed storage is simple, not horizontally scalable
 - in-memory plugin loading is sufficient for a single process
 - rule-based fallback models are basic
-- the WebUI is intentionally lightweight rather than framework-heavy
+- the WebUI is a separately built Vue SPA (`webui-dist/`); deploying from source requires the frontend build step

@@ -13,19 +13,26 @@ OneBot v11 AI assistant framework for QQ. Filters noise from group chats, summar
 - **Knowledge base** — semantic search over stored memories using embeddings + cosine similarity + reranking.
 - **Keyword alerts & quiet hours** — instant admin notification for keyword matches; configurable do-not-disturb window.
 - **Everything is a plugin** — summary, knowledge base, reply assistant, admin commands, and keyword alerts are all plugins built on the same interface as third-party plugins. Plugins are permissioned and hot-reloadable (file-watch + WebUI reload button), and can register their own WebUI routes and settings panels.
-- **WebUI** — light/dark/system theme, dashboard, model management (add / edit / delete / task binding), plugin toggles, knowledge base search, OneBot & WebSocket connection settings, summary controls, keyword alerts & quiet hours, reply queue management, message log viewer, config editor, and password-protected login.
+- **WebUI** — a separately built Vue 3 + Vuetify dashboard (Pinia, vue-router, vue-i18n, ApexCharts, Monaco) with light/dark/system themes, an onboarding dashboard, model provider workbench (add / edit / delete / test / fetch remote models / task binding), plugin toggles and hot reload, knowledge-base search, OneBot & WebSocket connection settings with live status, summary controls, keyword alerts & quiet hours, reply queue management, message log viewer, Monaco config editor, and password-protected login.
 - **Long-message chunking** — auto-splits messages that exceed QQ's character limit, splitting at paragraph / sentence boundaries.
 
 ## Quick Start
 
+Requires **Node.js >= 22** (see `.nvmrc`). Both lockfiles are committed — install with `npm ci`.
+
 ```bash
-npm install
-npm run dev        # hot-reload dev mode
-npm run build      # production build
+npm ci                 # backend dependencies
+npm --prefix webui ci  # dashboard dependencies (Vue 3 + Vuetify 3)
+npm run dev            # backend hot-reload; optional `npm run dev:webui` for the Vite dev server
+npm run build          # builds webui-dist/ (frontend) + dist/ (backend)
 npm start
 ```
 
-First run creates `config.json` from [`config.example.json`](./config.example.json).
+On first run the application creates `config.json` from its built-in defaults
+(`createDefaultAppConfig`); [`config.example.json`](./config.example.json) is a documented
+template, not the literal bootstrap source. The dashboard is served at `/ui` from
+`webui-dist/`; without that folder the API still works and `/ui` shows a "frontend not built"
+page.
 
 ## Tests
 
@@ -35,11 +42,34 @@ npm run test:ws            # WebSocket forward & reverse (18 tests)
 npm run test:kb            # Knowledge base (14 tests)
 npm run test:cmd           # Command permissions (3 tests)
 npm run test:logic         # Chunking, storage durability, reply routing (17 tests)
-npm run test:webui         # WebUI auth/session/redaction against a live server (19 tests)
+npm run test:webui         # WebUI auth/session/redaction against a live server (27 tests)
+npm run test:prod          # Production hardening: storage, auth, retries, summaries (35 tests)
+npm run test:i18n          # zh-CN / en-US locale key parity + static t() usage
+npm run typecheck:webui    # Vue SFC type check (vue-tsc)
 npm run test:all           # All of the above
 ```
 
 Set `LOG_LEVEL=debug|info|warn|error|silent` to control log verbosity (default `info`).
+
+## Dashboard
+
+Open `http://<host>:<port>/ui` after startup. The SPA routes are hash-based (`#/welcome`), so
+the configured `settings.uiPath` can be changed without rebuilding.
+
+| Page | Capability |
+|---|---|
+| Dashboard | onboarding checklist, health banners, stat cards, hourly activity chart, recent events/summaries |
+| Providers | schema-driven model form, test connection, fetch upstream models, enable toggle, task bindings and activation |
+| Plugins | enable/disable, hot reload, permissions |
+| Knowledge base | semantic search, add/delete entries, summarize, vector settings |
+| Connection | OneBot HTTP API + WebSocket (forward/reverse/both), live transport status, event path |
+| Message log | filterable recent events with auto refresh |
+| Summary & alerts | summary worker settings + manual flush, keyword alerts, quiet hours |
+| Pending replies | queue inspection, AI reply generation, dismiss |
+| Settings | theme/language, admins, admin password, Monaco `config.json` editor |
+
+The UI ships with Simplified Chinese and English locales, and follows AstrBot's dashboard
+design language (see [NOTICE](./NOTICE)).
 
 ## Configuration
 
@@ -47,9 +77,9 @@ Set `LOG_LEVEL=debug|info|warn|error|silent` to control log verbosity (default `
 
 | Plugin | Business config | Storage | WebUI panel |
 |---|---|---|---|
-| `builtin-summary` | enabled, interval, batch size, max events/prompt | `data/plugins/builtin-summary.json` | Summary |
+| `builtin-summary` | enabled, interval, batch size, max events/prompt | `data/plugins/builtin-summary.json` | Summary & alerts |
 | `builtin-knowledge` | enabled, max results, vector dimension | `data/plugins/builtin-knowledge.json` | Knowledge base |
-| `builtin-notify` | keywords, quiet hours | `data/plugins/builtin-notify.json` | Alerts |
+| `builtin-notify` | keywords, quiet hours | `data/plugins/builtin-notify.json` | Summary & alerts |
 
 On upgrade from an older version, leftover `runtime.summary` / `runtime.knowledgeBase` / `runtime.notifyKeywords` / `runtime.quietHours` are **automatically migrated** into the matching plugin storage on first boot (idempotent — `config.json` is rewritten clean afterwards). The knowledge base on/off switch is the `builtin-knowledge` plugin enabled state (legacy `knowledgeBase.enabled=false` → plugin disabled).
 
@@ -150,11 +180,14 @@ All commands are only processed when sent by a configured admin (`runtime.admins
 - [Architecture](./docs/architecture.md) — boundaries, data flow, invariants, future split points.
 - [Development](./docs/development.md) — build workflow, project layout, plugin authoring, model extension.
 - [Engineering principles](./docs/engineering-principles.md) — transport, admin separation, plugin permissions, storage, config.
+- [Deployment](./docs/deployment.md) — Docker Compose, systemd, reverse proxy + TLS, environment overrides, backup/restore, upgrades, security checklist.
 
 ## License
 
-[GPL-3.0](./LICENSE)
+[AGPL-3.0-or-later](./LICENSE)
 
 Copyright (C) 2025 PhantomDaze
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+Because this is the Affero variant, running a modified version as a network service also requires offering its users the corresponding source code. See [NOTICE](./NOTICE) for third-party acknowledgements.

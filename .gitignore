@@ -1,7 +1,8 @@
-/package-lock.json
 /config.json
 /data/
 /.idea/
 /dist/
 /node_modules/
 /ref/
+/webui-dist/
+/webui/node_modules/

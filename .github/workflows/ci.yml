@@ -5,18 +5,91 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [20, 22]
+        node-version: [22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      # package-lock.json is intentionally not committed, so use `npm install`.
-      - run: npm install
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            webui/package-lock.json
+      # 两个 lockfile 均已提交，使用 npm ci 保证可复现安装。
+      - run: npm ci
+      # The dashboard lives in webui/ with its own dependencies.
+      - run: npm --prefix webui ci
       - run: npm run test:all
+      - run: npm run typecheck:webui
       - run: npm run build
+      # The backend tests must also pass with the frontend build present.
+      - run: npm run test:webui
+      - name: Production smoke test
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          export PORT=3210
+          cp config.example.json "$WORK/config.json"
+          # 用配置文件和 BUSYCHAT_* 环境变量双保险：即使某个阶段的
+          # 环境变量覆盖尚未落地，临时工作目录里的 config.json 也能生效。
+          node -e '
+            const fs = require("node:fs");
+            const file = process.argv[1];
+            const dataDir = process.argv[2];
+            const config = JSON.parse(fs.readFileSync(file, "utf8"));
+            config.settings = { ...config.settings, host: "127.0.0.1", port: 3210, dataDir };
+            fs.writeFileSync(file, JSON.stringify(config, null, 2));
+          ' "$WORK/config.json" "$WORK/data"
+          cd "$WORK"
+          BUSYCHAT_CONFIG="$WORK/config.json" \
+          BUSYCHAT_DATA_DIR="$WORK/data" \
+          BUSYCHAT_HOST=127.0.0.1 \
+          BUSYCHAT_PORT="$PORT" \
+          LOG_LEVEL=info \
+            node "$GITHUB_WORKSPACE/dist/index.js" >"$WORK/server.log" 2>&1 &
+          PID=$!
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          READY=0
+          for _ in $(seq 1 60); do
+            if node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/health', { signal: AbortSignal.timeout(2000) }).then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "server exited before becoming healthy" >&2
+              cat "$WORK/server.log" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "health check did not become ready in 60s" >&2
+            cat "$WORK/server.log" >&2
+            exit 1
+          fi
+          kill -TERM "$PID" 2>/dev/null || true
+          set +e
+          wait "$PID"
+          CODE=$?
+          set -e
+          trap - EXIT
+          if [ "$CODE" -ne 0 ]; then
+            echo "graceful shutdown exited with code $CODE" >&2
+            cat "$WORK/server.log" >&2
+            exit 1
+          fi
+          echo "production smoke test passed (health OK, SIGTERM exit 0)"

@@ -1,0 +1,15 @@
+node_modules
+webui/node_modules
+dist
+webui-dist
+data
+config.json
+.git
+.gitignore
+.github
+docs/plan
+docs/archive
+test
+ref
+.idea
+*.log

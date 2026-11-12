@@ -1,0 +1,43 @@
+# BusyChat 反向代理示例（Caddy 自动申请/续期 TLS，自动处理 WebSocket）
+# 将 busychat.example.com 换成你的域名；Caddy 需要 80/443 可达。
+
+busychat.example.com {
+    encode zstd gzip
+
+    # 反向 WebSocket：Caddy 会自动透传 Upgrade 头。
+    @onebot_ws path /onebot/ws
+    handle @onebot_ws {
+        reverse_proxy 127.0.0.1:3000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+        }
+    }
+
+    # WebUI、API、健康检查、OneBot HTTP 事件入口。
+    handle {
+        reverse_proxy 127.0.0.1:3000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+        }
+    }
+
+    # 登录限流：Caddy 核心不含限流，可选用社区插件 caddy-ratelimit，
+    # 或在防火墙/云 WAF 层对 /api/login 限速。应用自身也按 IP 锁定失败登录。
+
+    # 安全响应头（应用已设置一部分，这里兜底）。
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}
+
+# 重要：通过反向代理访问时，应用必须设置 BUSYCHAT_TRUST_PROXY=1
+# （或 config.json 的 settings.trustProxy: true），否则登录限流与审计日志
+# 看到的都是 127.0.0.1。直连部署必须保持 0。

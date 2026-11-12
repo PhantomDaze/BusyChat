@@ -4,19 +4,26 @@ OneBot v11 AI assistant framework for QQ account supervision, message summarizat
 
 ## Quick Start
 
-```bash
-# 安装依赖
-npm install
+需要 **Node.js >= 22**（见 `.nvmrc`）。两个 lockfile 均已提交，请使用 `npm ci` 安装。
 
-# 开发模式（热重载）
+```bash
+# 安装后端依赖
+npm ci
+
+# 安装前端依赖（Vue 3 + Vuetify 3）
+npm --prefix webui ci
+
+# 开发模式（后端热重载；前端可另开 npm run dev:webui 走 Vite 代理）
 npm run dev
 
-# 生产构建
+# 生产构建：先构建 webui-dist/ 前端，再编译 dist/ 后端
 npm run build
 npm start
 ```
 
-首次运行会自动创建 `config.json`，使用 [`config.example.json`](./config.example.json) 作为模板。
+首次运行会以内置默认值（`createDefaultAppConfig`）创建 `config.json`；[`config.example.json`](./config.example.json)
+是供运维参考的模板，并不是启动时直接复制的源文件。
+仪表盘由 `webui-dist/` 静态托管在 `/ui`；如果缺少该目录，HTTP API 仍可用，`/ui` 会显示“前端未构建”提示页。
 
 ## 测试
 
@@ -36,10 +43,19 @@ npm run test:cmd
 # 分片/存储持久化/回复路由测试（17 项）
 npm run test:logic
 
-# WebUI 认证/会话/脱敏测试（19 项，启动真实服务器）
+# WebUI 认证/会话/脱敏测试（27 项，启动真实服务器）
 npm run test:webui
 
-# 全部测试
+# 生产加固回归测试（35 项：存储持久化/鉴权/重试/摘要）
+npm run test:prod
+
+# 前端 i18n 键一致性 + 静态 t() 使用检查
+npm run test:i18n
+
+# 前端 Vue SFC 类型检查
+npm run typecheck:webui
+
+# 全部测试（含 test:i18n）
 npm run test:all
 ```
 
@@ -47,26 +63,23 @@ npm run test:all
 
 ## WebUI 仪表盘
 
-启动后访问 `http://<host>:<port>/ui` 进入 WebUI（未设密码时任何能访问该地址的人都可以完全控制机器人，建议在「管理员」页立即设置密码）。
+启动后访问 `http://<host>:<port>/ui` 进入 WebUI（未设密码时任何能访问该地址的人都可以完全控制机器人，建议登录后立即在「系统设置 → 安全」设置密码）。
 
-WebUI 提供以下页面（所有 runtime 配置项均可即时生效，无需重启）：
+前端已整体改写为独立的 Vue 3 SPA（`webui/`，Vite 构建到 `webui-dist/`）：Vuetify 3 组件库、Pinia 状态、vue-router（hash 路由）、vue-i18n（简体中文 / English）、ApexCharts 图表、Monaco 配置编辑器；视觉与信息架构参照 AstrBot 最新 dashboard（AGPL-3.0，致谢见 [NOTICE](./NOTICE)）。后端只负责 `/api/*` 与静态托管，所有 runtime 配置项保存后即时生效。
 
 | 页面 | 功能 |
 |---|---|
-| 仪表盘 | 运行概览、最近消息、最近摘要 |
-| 模型 | 任务绑定、启停、**添加/编辑/删除模型**（表单可视化配置，API Key 脱敏显示） |
-| 插件 | 启停插件、全部重载 |
-| 知识库 | 语义搜索、添加/删除条目 |
-| 管理员 | 添加/移除管理员、设置管理密码 |
-| OneBot | HTTP API 地址、前缀、Access Token、自身 QQ 号、超时 |
-| WS | WebSocket 模式/地址/重连/超时，实时状态 |
-| 摘要 | 开关、间隔、触发条数、单次最大事件、立即生成 |
-| 告警 | 关键词列表增删、免打扰时段 |
-| 回复 | 待回复队列、AI 生成回复、忽略 |
-| 日志 | 消息日志（按范围/发送者过滤） |
-| 配置 | 直接编辑 config.json（脱敏） |
+| 仪表盘 | 就绪检查清单、健康告警（未设密码/无管理员/仅回退模型）、统计卡片、按小时活跃度图表、最近消息与摘要 |
+| 模型服务 | 模型列表 + schema 驱动参数表单、测试连接、拉取上游模型、启停、任务绑定、按任务激活（API Key 脱敏） |
+| 插件 | 启停插件、全部热重载、权限与清单信息 |
+| 知识库 | 语义搜索、添加/删除条目、条目总结、向量维度设置 |
+| 连接与协议 | OneBot HTTP API、WebSocket 模式/地址/重连/超时、实时连接状态、事件上报路径 |
+| 消息日志 | 按范围/发送者类型过滤，可自动刷新 |
+| 摘要与告警 | 摘要开关/间隔/触发条数/单次最大事件、立即生成、关键词告警、免打扰时段 |
+| 待回复 | 待回复队列、AI 生成回复、忽略 |
+| 系统设置 | 主题/语言、管理员、管理密码、Monaco 直接编辑 config.json（脏检查 + 密钥脱敏回填） |
 
-界面支持浅色 / 深色 / 跟随系统三种主题（侧边栏底部切换，存 localStorage）。
+界面支持浅色 / 深色 / 跟随系统三种主题（顶栏切换，存 localStorage，首屏由 `theme-boot.js` 预置避免闪白），语言可即时切换。侧边栏在窄屏下自动收起为抽屉，桌面端可折叠为图标栏。
 
 ## 配置文件与插件配置
 
@@ -74,9 +87,9 @@ WebUI 提供以下页面（所有 runtime 配置项均可即时生效，无需�
 
 | 插件 | 业务配置 | 存储位置 | WebUI 页面 |
 |---|---|---|---|
-| `builtin-summary` | 开关、间隔、触发条数、单次最大事件 | `data/plugins/builtin-summary.json` | 摘要 |
+| `builtin-summary` | 开关、间隔、触发条数、单次最大事件 | `data/plugins/builtin-summary.json` | 摘要与告警 |
 | `builtin-knowledge` | 开关、最大结果数、向量维度 | `data/plugins/builtin-knowledge.json` | 知识库 |
-| `builtin-notify` | 关键词、免打扰时段 | `data/plugins/builtin-notify.json` | 告警 |
+| `builtin-notify` | 关键词、免打扰时段 | `data/plugins/builtin-notify.json` | 摘要与告警 |
 
 从旧版本升级时，`config.json` 中遗留的 `runtime.summary` / `runtime.knowledgeBase` / `runtime.notifyKeywords` / `runtime.quietHours` 会在首次启动时**自动迁移**到对应插件的存储（幂等：迁移完成后 config.json 会被重写为干净形态）。知识库开关对应 `builtin-knowledge` 插件的启用状态（旧 `knowledgeBase.enabled=false` → 插件禁用）。
 
@@ -218,9 +231,14 @@ The detailed project notes live in [`docs`](./docs). Keep README as the entry po
 - [Architecture notes](./docs/architecture.md): boundaries, data flow, invariants, configuration ownership, and future split points.
 - [Development guide](./docs/development.md): install/build workflow, repository layout, JSON config workflow, runtime persistence, plugin authoring, model extension, WebUI workflow, and admin reporting rules.
 - [Engineering principles](./docs/engineering-principles.md): implementation rules for transport, admin separation, plugin permissions, storage, model tasks, config files, and UTF-8 text.
+- [Deployment guide](./docs/deployment.md): Docker Compose, systemd, reverse proxy + TLS, environment overrides, backup/restore, upgrades, and the security checklist.
 
 ## 许可证
 
-[GPL-3.0](./LICENSE)
+[AGPL-3.0-or-later](./LICENSE)
 
 Copyright (C) 2025 PhantomDaze
+
+本程序是自由软件：你可以依据自由软件基金会发布的 GNU Affero 通用公共许可证（第 3 版或你选择的任何更新版本）条款重新分发和/或修改它。
+
+由于采用 AGPL 变体，将修改后的版本作为网络服务提供时，还需要向使用者提供对应的源代码。第三方致谢见 [NOTICE](./NOTICE)。

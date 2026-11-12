@@ -2,22 +2,33 @@
   "name": "f261agent",
   "version": "1.0.0",
   "description": "OneBot v11 AI assistant framework",
-  "license": "GPL-3.0",
+  "license": "AGPL-3.0-or-later",
   "author": "PhantomDaze",
   "type": "commonjs",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "build": "npm run build:webui && npm run build:server",
+    "build:server": "npm run clean:server && tsc -p tsconfig.json",
+    "build:webui": "npm --prefix webui run build",
+    "install:webui": "npm --prefix webui install",
     "dev": "tsx watch src/index.ts",
+    "dev:webui": "npm --prefix webui run dev",
+    "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run typecheck",
+    "typecheck:webui": "npm --prefix webui run typecheck",
+    "test:i18n": "tsx webui/scripts/check-i18n.ts",
+    "test": "npm run test:all",
     "test:ws": "tsx test/onebot-ws.test.ts",
     "test:kb": "tsx test/knowledge.test.ts",
     "test:cmd": "tsx test/commands.test.ts",
     "test:logic": "tsx test/logic.test.ts",
     "test:webui": "tsx test/webui.test.ts",
-    "test:all": "npm run typecheck && npm run test:ws && npm run test:kb && npm run test:cmd && npm run test:logic && npm run test:webui"
+    "test:prod": "tsx test/production.test.ts",
+    "test:all": "npm run typecheck && npm run test:i18n && npm run test:ws && npm run test:kb && npm run test:cmd && npm run test:logic && npm run test:webui && npm run test:prod",
+    "clean:server": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@hapi/hapi": "^21.4.9",
@@ -25,7 +36,7 @@
     "ws": "^8.21.0"
   },
   "devDependencies": {
-    "@types/node": "^25.9.2",
+    "@types/node": "^22.10.2",
     "@types/ws": "^8.18.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"

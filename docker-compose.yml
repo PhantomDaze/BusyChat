@@ -1,0 +1,29 @@
+services:
+  busychat:
+    build: .
+    image: busychat:latest
+    restart: unless-stopped
+    ports:
+      # 只绑定回环，由 nginx/Caddy 终止 TLS 后转发；不要直接暴露到公网。
+      - "127.0.0.1:3000:3000"
+    volumes:
+      # 数据目录（f261agent.db、插件存储）与配置文件。
+      # config.json 必须可写：WebUI 会原地保存配置。
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      BUSYCHAT_CONFIG: /app/config.json
+      BUSYCHAT_DATA_DIR: /app/data
+      BUSYCHAT_HOST: 0.0.0.0
+      BUSYCHAT_PORT: "3000"
+      LOG_LEVEL: info
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:' + (process.env.BUSYCHAT_PORT || '3000') + '/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

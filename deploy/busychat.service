@@ -1,0 +1,56 @@
+# /etc/systemd/system/busychat.service
+#
+# 安装：
+#   sudo useradd --system --home /opt/busychat --shell /usr/sbin/nologin busychat
+#   sudo install -d -o busychat -g busychat /var/lib/busychat /etc/busychat
+#   sudo cp config.example.json /etc/busychat/config.json
+#   sudo chown busychat:busychat /etc/busychat/config.json
+#   sudo chmod 0600 /etc/busychat/config.json
+#   sudo systemctl daemon-reload && sudo systemctl enable --now busychat
+
+[Unit]
+Description=BusyChat (F261Agent) OneBot v11 assistant
+Documentation=file:///opt/busychat/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=busychat
+Group=busychat
+WorkingDirectory=/opt/busychat
+
+# 代码目录只读；配置与数据目录显式可写（见下方 ReadWritePaths）。
+Environment=NODE_ENV=production
+Environment=LOG_LEVEL=info
+Environment=BUSYCHAT_CONFIG=/etc/busychat/config.json
+Environment=BUSYCHAT_DATA_DIR=/var/lib/busychat
+Environment=BUSYCHAT_HOST=127.0.0.1
+Environment=BUSYCHAT_PORT=3000
+# 仅在确实通过反向代理访问时启用；直连部署保持 0（默认）。
+Environment=BUSYCHAT_TRUST_PROXY=0
+
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+# 最小权限硬化
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+# 仅这两个目录可写：配置目录（WebUI 保存 config.json）与数据目录（SQLite）。
+ReadWritePaths=/etc/busychat /var/lib/busychat
+
+[Install]
+WantedBy=multi-user.target
