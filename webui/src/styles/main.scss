@@ -1,0 +1,327 @@
+/* BusyChat WebUI 全局样式
+   主题 token 由 Vuetify 主题提供（rgb(var(--v-theme-*))）；
+   这里只放布局、滚动条和少量组件微调。 */
+
+html,
+body {
+  overscroll-behavior-y: none;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei',
+    'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.v-application {
+  font-family: inherit !important;
+}
+
+.page-wrapper {
+  min-height: calc(100vh - 64px);
+  padding: 12px;
+  background: rgb(var(--v-theme-containerBg));
+}
+
+/* ---------- 顶栏 ---------- */
+.top-header {
+  border-bottom: 1px solid rgba(var(--v-theme-borderLight), 0.5);
+  backdrop-filter: blur(6px);
+}
+
+.top-header .header-title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.top-header .header-sub {
+  font-size: 12px;
+  color: rgba(var(--v-theme-secondaryText), 0.7);
+}
+
+/* ---------- 侧边栏 ---------- */
+.leftSidebar {
+  border: 0;
+  border-right: 1px solid rgba(var(--v-theme-borderLight), 0.45);
+  box-shadow: none !important;
+}
+
+.leftSidebar .sidebar-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.leftSidebar .sidebar-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.leftSidebar .sidebar-footer {
+  flex-shrink: 0;
+  padding: 12px 14px 16px;
+  border-top: 1px solid rgba(var(--v-theme-borderLight), 0.35);
+}
+
+.leftSidebar .v-list {
+  padding: 4px 8px;
+}
+
+.leftSidebar .v-list-item {
+  min-height: 42px;
+  border-radius: 10px;
+  padding-inline-start: calc(12px + var(--indent-padding, 0px) / 2) !important;
+}
+
+.leftSidebar .v-list-item-title {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.leftSidebar .v-list-item:hover {
+  color: rgb(var(--v-theme-primary));
+}
+
+.leftSidebar .v-list-item--active {
+  color: rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.1);
+}
+
+.leftSidebar .v-list-item--active .v-list-item-title,
+.leftSidebar .v-list-item--active .v-icon {
+  color: rgb(var(--v-theme-primary)) !important;
+}
+
+.leftSidebar .v-list-subheader {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  min-height: 32px;
+  padding-inline-start: 16px !important;
+}
+
+.v-navigation-drawer--rail.leftSidebar .v-list-item {
+  width: 56px;
+  min-width: 56px;
+  max-width: 56px;
+  min-height: 48px;
+  margin: 2px auto 6px;
+  padding-inline: 0 !important;
+  display: flex;
+  justify-content: center;
+}
+
+.v-navigation-drawer--rail.leftSidebar .v-list-item__prepend {
+  width: 100%;
+  justify-content: center;
+  padding: 0 !important;
+}
+
+.v-navigation-drawer--rail.leftSidebar .v-list-item__spacer,
+.v-navigation-drawer--rail.leftSidebar .v-list-item__content {
+  display: none;
+}
+
+/* ---------- 通用页面元素 ---------- */
+.mono {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+.muted {
+  color: rgba(var(--v-theme-secondaryText), 0.75);
+}
+
+/* Vuetify 3.7 没有内置 min-w-0：flex 子项默认 min-width:auto，长模型名在窄屏会把开关挤出卡片 */
+.min-w-0 {
+  min-width: 0 !important;
+}
+
+/* 模型列表滚动区：桌面端限制高度，移动端交给页面滚动 */
+.model-list-scroll {
+  max-height: calc(100vh - 330px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+@media (max-width: 959px) {
+  .model-list-scroll {
+    max-height: none;
+    overflow: visible;
+  }
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.page-header h1 {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.2px;
+}
+
+.page-header p {
+  margin-top: 4px;
+  font-size: 13px;
+  color: rgba(var(--v-theme-secondaryText), 0.75);
+}
+
+.section-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.stat-card {
+  height: 100%;
+  transition:
+    transform 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.stat-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 26px rgba(16, 24, 40, 0.08) !important;
+}
+
+.stat-value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: rgba(var(--v-theme-secondaryText), 0.72);
+}
+
+.list-row {
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(var(--v-theme-borderLight), 0.28);
+}
+
+.list-row:last-child {
+  border-bottom: 0;
+}
+
+.list-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-sub {
+  font-size: 12px;
+  color: rgba(var(--v-theme-secondaryText), 0.65);
+}
+
+.model-list-item {
+  cursor: pointer;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  padding: 10px 12px;
+  transition: background-color 0.15s ease;
+}
+
+.model-list-item:hover {
+  background: rgba(var(--v-theme-primary), 0.06);
+}
+
+.model-list-item.active {
+  background: rgba(var(--v-theme-primary), 0.1);
+  border-color: rgba(var(--v-theme-primary), 0.28);
+}
+
+.editor-shell {
+  height: 440px;
+  border: 1px solid rgba(var(--v-theme-borderLight), 0.6);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.log-table {
+  font-size: 13px;
+}
+
+.log-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgb(var(--v-theme-surface));
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(var(--v-theme-secondaryText), 0.72);
+  white-space: nowrap;
+}
+
+.log-table tbody tr:hover {
+  background: rgba(var(--v-theme-primary), 0.04);
+}
+
+.log-scroll {
+  max-height: 62vh;
+  overflow: auto;
+}
+
+/* ---------- 登录页 ---------- */
+.auth-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(1200px 600px at 10% 0%, rgba(var(--v-theme-primary), 0.16), transparent 60%),
+    radial-gradient(900px 500px at 100% 100%, rgba(var(--v-theme-secondary), 0.14), transparent 55%),
+    rgb(var(--v-theme-background));
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 30px 28px 24px;
+  border: 1px solid rgba(var(--v-theme-borderLight), 0.5);
+  background: rgb(var(--v-theme-surface));
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.auth-brand span {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.3px;
+}
+
+/* ---------- 滚动条 ---------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(var(--v-theme-secondaryText), 0.28) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(var(--v-theme-secondaryText), 0.24);
+  border-radius: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
