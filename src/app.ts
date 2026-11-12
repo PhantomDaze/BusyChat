@@ -10,6 +10,7 @@ import { normalizeOneBotMessageEvent, OneBotClient } from './onebot';
 import { OneBotWebSocketTransport } from './onebot-ws';
 import { AdminPolicy } from './policies';
 import { PluginManager } from './plugins';
+import { hashPassword, isLoopbackAddress } from './security';
 import { FileStore } from './storage';
 import type {
   AppServices,
@@ -53,6 +54,7 @@ export class BotApplication {
     this.oneBotWebSocket = new OneBotWebSocketTransport({
       runtime: this.runtime,
       appLogger: this.logger.child('onebot-ws'),
+      trustProxy: settings.trustProxy === true,
       handleIncomingEvent: this.handleIncomingEvent.bind(this),
     });
     this.bot.setActionTransport(this.oneBotWebSocket);
@@ -171,8 +173,41 @@ export class BotApplication {
     await this.runtime.replace(nextRuntime);
   }
 
+  /**
+   * 把旧版明文 runtime.ui.password 迁移为 scrypt 摘要。幂等：迁移后明文被删除，
+   * 下次启动直接跳过。
+   */
+  private async migrateLegacyUiPassword(): Promise<void> {
+    const runtime = await this.runtime.snapshot();
+    const plaintext = runtime.ui.password;
+    if (!plaintext || runtime.ui.passwordHash) return;
+
+    // 少于 6 位的旧密码不迁移成摘要：否则弱密码会以「有效凭据」的身份
+    // 继续允许远程登录。直接删除明文，退回「仅本机可设置新密码」的安全状态。
+    if (plaintext.length < 6) {
+      await this.runtime.update((state) => {
+        if (!state.ui.password || state.ui.passwordHash) return;
+        delete state.ui.password;
+      });
+      this.logger.warn(
+        'legacy WebUI password was shorter than 6 characters and has been removed; ' +
+          'set a new password from a browser on the local machine',
+      );
+      return;
+    }
+
+    const passwordHash = await hashPassword(plaintext);
+    await this.runtime.update((state) => {
+      if (!state.ui.password || state.ui.passwordHash) return;
+      state.ui.passwordHash = passwordHash;
+      delete state.ui.password;
+    });
+    this.logger.info('legacy WebUI plaintext password migrated to passwordHash');
+  }
+
   async initialize(): Promise<void> {
     await this.config.ensureReady();
+    await this.migrateLegacyUiPassword();
     await this.store.ensureReady();
     await this.migrateLegacyPluginConfigs();
 
@@ -233,9 +268,20 @@ export class BotApplication {
           : this.settings.host;
       const uiUrl = `http://${displayHost}:${this.settings.port}${this.settings.uiPath}`;
       const ws = runtime.onebot.webSocket;
+      const hostIsLoopback = isLoopbackAddress(this.settings.host);
+      const hasAccessToken = Boolean(runtime.onebot.accessToken);
+      const wsRemoteExposed = ws.mode === 'reverse' || ws.mode === 'both';
+      const uiAuthMode = runtime.ui.passwordHash
+        ? '已设置密码（scrypt 摘要）'
+        : runtime.ui.password
+          ? '旧版明文密码（启动时已迁移为摘要）'
+          : runtime.ui.authToken
+            ? '仅旧版 authToken'
+            : '未设密码 — 仅允许本机直连，远程请求会被拒绝';
 
       const lines: string[] = ['── 启动自检 ──'];
-      lines.push(`WebUI:   ${uiUrl}${runtime.ui.password ? '' : '（未设密码，任何人可访问 — 请在 WebUI「管理员」页设置）'}`);
+      lines.push(`WebUI:   ${uiUrl}`);
+      lines.push(`WebUI鉴权: ${uiAuthMode}`);
       lines.push(
         runtime.admins.length > 0
           ? `管理员:  ${runtime.admins.length} 个（${runtime.admins.join(', ')}）`
@@ -248,12 +294,27 @@ export class BotApplication {
       );
       lines.push(
         ws.mode === 'off'
-          ? 'OneBot:  WebSocket 已关闭 — 请在 WebUI「WS」页选择 forward 或 reverse 模式'
-          : `OneBot:  ${ws.mode}${ws.mode !== 'reverse' ? ` → ${ws.forwardUrl || '(未填地址)'}` : ''}${ws.mode !== 'forward' ? ` | 反向路径 ${ws.reversePath}` : ''}`,
+          ? `OneBot入口: token=${hasAccessToken ? '已设置' : '未设置'} | WS 已关闭 | host=${this.settings.host}`
+          : `OneBot入口: token=${hasAccessToken ? '已设置' : '未设置'} | mode=${ws.mode}${ws.mode !== 'reverse' ? ` → ${ws.forwardUrl || '(未填地址)'}` : ''}${ws.mode !== 'forward' ? ` | 反向路径 ${ws.reversePath}` : ''} | host=${this.settings.host}`,
+      );
+      lines.push(
+        `代理设置: trustProxy=${this.settings.trustProxy === true ? 'true（信任 X-Forwarded-*）' : 'false（忽略代理头）'}`,
       );
 
       for (const line of lines) {
         this.logger.info(line);
+      }
+
+      // accessToken 缺失时，任何远程 OneBot 入口都会被 fail-closed 拒绝。
+      if (!hasAccessToken && (!hostIsLoopback || wsRemoteExposed)) {
+        this.logger.error(
+          [
+            'OneBot 远程入口未配置 accessToken —— 远程 HTTP 事件上报与反向 WebSocket 将被拒绝。',
+            `  host=${this.settings.host}（${hostIsLoopback ? '回环' : '非回环'}） mode=${ws.mode}`,
+            '  请在 config.json 的 runtime.onebot.accessToken 或 WebUI「OneBot」页设置 token，',
+            '  否则只有本机直连（无代理头）的上报会被接受。',
+          ].join('\n'),
+        );
       }
     } catch (error) {
       this.logger.warn('startup checklist failed', {

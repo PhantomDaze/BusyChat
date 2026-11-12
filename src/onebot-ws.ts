@@ -5,6 +5,13 @@ import type { Socket } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
 
 import type { OneBotActionTransport } from './onebot';
+import {
+  effectiveClientIp,
+  isLoopbackAddress,
+  isLoopbackHost,
+  isProxiedRequest,
+  safeEqual,
+} from './security';
 import type {
   JsonObject,
   Logger,
@@ -16,6 +23,8 @@ import type {
 interface OneBotWebSocketTransportDependencies {
   runtime: RuntimeStore;
   appLogger: Logger;
+  /** 是否信任反向代理头（与 settings.trustProxy 一致）。 */
+  trustProxy?: boolean;
   handleIncomingEvent: (payload: JsonObject, headers: Record<string, unknown>) => Promise<unknown>;
 }
 
@@ -37,24 +46,32 @@ function readHeaderValue(value: string | string[] | undefined): string | undefin
   return value;
 }
 
-function authorizeUpgrade(request: IncomingMessage, accessToken?: string): boolean {
+/**
+ * 反向 WS 升级鉴权。未配置 accessToken 时只允许本机直连（回环地址且无代理头），
+ * 否则远程连接会被拒绝 —— 避免反向 WS 成为一个无鉴权的远程代码执行入口。
+ */
+function authorizeUpgrade(request: IncomingMessage, accessToken: string | undefined, trustProxy: boolean): boolean {
   if (!accessToken) {
-    return true;
+    return (
+      isLoopbackAddress(effectiveClientIp(request, trustProxy)) &&
+      !isProxiedRequest(request) &&
+      isLoopbackHost(readHeaderValue(request.headers.host))
+    );
   }
 
   const url = new URL(request.url ?? '/', 'http://localhost');
   const queryToken = url.searchParams.get('access_token') ?? undefined;
-  if (queryToken && queryToken === accessToken) {
+  if (queryToken && safeEqual(queryToken, accessToken)) {
     return true;
   }
 
   const auth = readHeaderValue(request.headers.authorization);
-  if (auth?.startsWith('Bearer ') && auth.slice('Bearer '.length) === accessToken) {
+  if (auth?.startsWith('Bearer ') && safeEqual(auth.slice('Bearer '.length), accessToken)) {
     return true;
   }
 
   const headerToken = readHeaderValue(request.headers['x-access-token']);
-  return Boolean(headerToken && headerToken === accessToken);
+  return Boolean(headerToken && safeEqual(headerToken, accessToken));
 }
 
 function rejectUpgrade(socket: Socket, statusCode: number, message: string): void {
@@ -83,9 +100,15 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
   private reverseWss: WebSocketServer | null = null;
   private reverseClients = new Map<WebSocket, Record<string, unknown>>();
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempts = 0;
   private stopped = true;
   private connecting = false;
   private pending = new Map<string, PendingAction>();
+  /** 每个 socket 上一次心跳 tick 之后是否收到过 pong/消息。 */
+  private readonly alive = new WeakMap<WebSocket, boolean>();
+  private lastPongAt: number | null = null;
+  private static readonly MAX_REVERSE_CLIENTS = 16;
 
   /** Pick a socket that is actually OPEN, preferring the forward connection. */
   private pickReadySocket(): WebSocket | null {
@@ -105,7 +128,7 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
   // -----------------------------------------------------------------------
 
   attachReverse(server: http.Server): void {
-    this.reverseWss = new WebSocketServer({ noServer: true });
+    this.reverseWss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 
     this.reverseWss.on('connection', (ws, request) => {
       const headers = headersToRecord(request.headers);
@@ -130,6 +153,7 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
   async start(): Promise<void> {
     this.stopped = false;
     const runtime = await this.deps.runtime.snapshot();
+    this.startHeartbeat(runtime.onebot.webSocket.heartbeatIntervalMs);
     if (runtime.onebot.webSocket.mode === 'forward' || runtime.onebot.webSocket.mode === 'both') {
       this.scheduleForwardReconnect(0);
     }
@@ -142,6 +166,11 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    this.reconnectAttempts = 0;
 
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
@@ -188,19 +217,65 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
   // -----------------------------------------------------------------------
 
   isActionReady(): boolean {
-    return Boolean(
-      (this.forwardWs && this.forwardWs.readyState === WebSocket.OPEN) ||
-        this.reverseClients.size > 0,
-    );
+    if (this.forwardWs && this.forwardWs.readyState === WebSocket.OPEN) return true;
+    for (const ws of this.reverseClients.keys()) {
+      if (ws.readyState === WebSocket.OPEN) return true;
+    }
+    return false;
   }
 
-  getStatus(): { forwardConnected: boolean; reverseConnected: boolean; reversePeerCount: number; stopped: boolean } {
+  getStatus(): {
+    forwardConnected: boolean;
+    reverseConnected: boolean;
+    reversePeerCount: number;
+    stopped: boolean;
+    lastPongAt: number | null;
+  } {
+    let reversePeerCount = 0;
+    for (const ws of this.reverseClients.keys()) {
+      if (ws.readyState === WebSocket.OPEN) reversePeerCount += 1;
+    }
     return {
       forwardConnected: this.forwardWs !== null && this.forwardWs.readyState === WebSocket.OPEN,
-      reverseConnected: this.reverseClients.size > 0,
-      reversePeerCount: this.reverseClients.size,
+      reverseConnected: reversePeerCount > 0,
+      reversePeerCount,
       stopped: this.stopped,
+      lastPongAt: this.lastPongAt,
     };
+  }
+
+  // -----------------------------------------------------------------------
+  // Heartbeat (liveness detection for half-open sockets)
+  // -----------------------------------------------------------------------
+
+  private startHeartbeat(intervalMs: number | undefined): void {
+    if (this.heartbeatTimer) return;
+    const interval = intervalMs ?? 30_000;
+    if (!Number.isFinite(interval) || interval <= 0) return;
+    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), interval);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private heartbeatTick(): void {
+    const sockets: WebSocket[] = [];
+    if (this.forwardWs) sockets.push(this.forwardWs);
+    for (const ws of this.reverseClients.keys()) sockets.push(ws);
+
+    for (const ws of sockets) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      // 上一 tick 之后完全没有 pong/消息：判定为半开连接，直接终止以触发重连。
+      if (this.alive.get(ws) === false) {
+        this.deps.appLogger.warn('onebot websocket heartbeat timed out; terminating socket');
+        ws.terminate();
+        continue;
+      }
+      this.alive.set(ws, false);
+      try {
+        ws.ping();
+      } catch {
+        ws.terminate();
+      }
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -223,6 +298,13 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
     return new Promise<OneBotActionResponse<T>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(echo);
+        // 超时说明该连接可能已半死：终止它，让 forward 走重连、reverse 被移除，
+        // 而不是继续把后续请求发给一个无响应的 socket。
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
         reject(new Error(`onebot websocket action ${action} timed out`));
       }, timeoutMs);
 
@@ -267,7 +349,12 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
       return;
     }
 
-    if (!authorizeUpgrade(request, runtime.onebot.accessToken)) {
+    if (this.reverseClients.size >= OneBotWebSocketTransport.MAX_REVERSE_CLIENTS) {
+      rejectUpgrade(socket, 503, 'Service Unavailable');
+      return;
+    }
+
+    if (!authorizeUpgrade(request, runtime.onebot.accessToken, this.deps.trustProxy === true)) {
       rejectUpgrade(socket, 401, 'Unauthorized');
       return;
     }
@@ -292,8 +379,15 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
     if (label === 'reverse') {
       this.reverseClients.set(ws, headers);
     }
+    this.alive.set(ws, true);
+
+    ws.on('pong', () => {
+      this.alive.set(ws, true);
+      this.lastPongAt = Date.now();
+    });
 
     ws.on('message', (data) => {
+      this.alive.set(ws, true);
       void this.handleMessage(data, headers).catch((error) => {
         this.deps.appLogger.warn('onebot websocket message handling failed', {
           error: error instanceof Error ? error.message : String(error),
@@ -389,7 +483,20 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
       return;
     }
     const runtime = await this.deps.runtime.snapshot();
-    this.scheduleForwardReconnect(runtime.onebot.webSocket.reconnectIntervalMs);
+    this.scheduleForwardReconnect(this.nextReconnectDelay(runtime.onebot.webSocket.reconnectIntervalMs));
+  }
+
+  /**
+   * 指数退避 + 抖动：base、2x、4x… 上限 60s，抖动 0.5x-1.5x，
+   * 避免大量实例在协议端重启时同时重连。连接成功后 attempts 归零。
+   */
+  private nextReconnectDelay(baseMs: number): number {
+    const base = Number.isFinite(baseMs) && baseMs > 0 ? baseMs : 5_000;
+    const exponent = Math.min(this.reconnectAttempts, 16);
+    const capped = Math.min(base * 2 ** exponent, 60_000);
+    this.reconnectAttempts += 1;
+    const jitter = 0.5 + Math.random();
+    return Math.max(100, Math.min(60_000, Math.round(capped * jitter)));
   }
 
   private async connectForward(): Promise<void> {
@@ -474,6 +581,7 @@ export class OneBotWebSocketTransport implements OneBotActionTransport {
             return;
           }
           this.forwardWs = ws;
+          this.reconnectAttempts = 0;
           this.setupClient(ws, headers, 'forward');
           this.deps.appLogger.info('onebot forward websocket connected', { url: forwardUrl });
           resolve();

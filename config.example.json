@@ -13,6 +13,9 @@
     "port": 3000,
     "_port": "监听端口。",
 
+    "trustProxy": false,
+    "_trustProxy": "是否信任反向代理的 X-Forwarded-For / X-Forwarded-Proto 头。仅当应用只通过 nginx / Caddy 等反向代理访问时设为 true；直连或容器端口公开时必须保持 false，否则客户端可伪造来源 IP。对应环境变量 BUSYCHAT_TRUST_PROXY=1。",
+
     "pluginSearchDirs": ["dist/plugins", "src/plugins"],
     "_pluginSearchDirs": "第三方插件搜索目录，按优先级排列。内置插件由内核直接注册，不通过此处发现。开发时 src/plugins 优先，生产用 dist/plugins。",
 
@@ -39,7 +42,7 @@
       "_apiPrefix": "API 路径前缀，通常为 /api。",
 
       "accessToken": "",
-      "_accessToken": "OneBot access_token（可选）。如果 OneBot 实现配置了 token，请填写。",
+      "_accessToken": "OneBot access_token。必填场景：事件入口（settings.eventPath）或反向 WebSocket 可被本机以外访问时，必须填写与 OneBot 实现一致的 token，否则应用会拒绝这些请求；仅当服务只监听回环地址且不经过反向代理时才可以留空。对应环境变量不提供覆盖，请直接写入 config.json 并保持文件 0600。",
 
       "selfId": "",
       "_selfId": "机器人自身的 QQ 号（可选）。不填则从上报事件中自动获取。",
@@ -63,7 +66,10 @@
         "_reconnectIntervalMs": "正向模式断线后重连间隔（毫秒）。",
 
         "actionTimeoutMs": 10000,
-        "_actionTimeoutMs": "WebSocket API 调用的超时（毫秒）。"
+        "_actionTimeoutMs": "WebSocket API 调用的超时（毫秒）。",
+
+        "heartbeatIntervalMs": 30000,
+        "_heartbeatIntervalMs": "WebSocket 心跳间隔（毫秒）。用于发现半开连接并触发重连；设为 0 可关闭。"
       }
     },
 
@@ -151,11 +157,16 @@
       "title": "F261Agent",
       "_title": "仪表盘页面标题。",
 
+      "passwordHash": "",
+      "_passwordHash": "WebUI 登录密码的 scrypt 摘要（格式 scrypt$N$r$p$salt$key）。推荐在 WebUI「管理员」页直接设置密码，由服务端生成摘要；不要手工编辑本字段。",
+
       "password": "",
-      "_password": "WebUI 登录密码（明文存储）。留空则不要求登录。设置后访问 WebUI 需先输入密码。",
+      "_password": "旧版明文密码（兼容字段）。启动时会自动迁移为 passwordHash 并删除本字段；新部署请留空，改用 WebUI 设置密码。",
 
       "authToken": "",
-      "_authToken": "WebUI 访问令牌（旧方式，可选）。设置后需在 Header x-admin-token 或 query ?token= 中传入。"
+      "_authToken": "旧版 WebUI 访问令牌（可选）。设置后需在请求头 x-admin-token 中传入；出于安全考虑不再接受 query string 令牌。",
+
+      "_authNote": "未配置 passwordHash / password / authToken 时，WebUI 只允许本机直连（回环地址且无代理头）访问，远程管理请求一律 401，直到设置密码。"
     }
   }
 }

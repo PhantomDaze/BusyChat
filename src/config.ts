@@ -34,6 +34,16 @@ function toPositiveInteger(value: unknown): number | undefined {
   return normalized > 0 ? normalized : undefined;
 }
 
+/** 允许 0 的非负整数（心跳间隔 0 表示关闭）。 */
+function toNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined;
+  }
+
+  const normalized = Math.floor(value);
+  return normalized >= 0 ? normalized : undefined;
+}
+
 function toBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
@@ -158,6 +168,7 @@ export function createDefaultOneBotSettings(): OneBotClientConfig {
       reversePath: '/onebot/ws',
       reconnectIntervalMs: 5_000,
       actionTimeoutMs: 10_000,
+      heartbeatIntervalMs: 30_000,
     },
   };
 }
@@ -178,6 +189,7 @@ export function createDefaultAppSettings(): AppSettings {
     dataDir: 'data',
     host: '127.0.0.1',
     port: 3000,
+    trustProxy: false,
     pluginSearchDirs: ['dist/plugins', 'src/plugins'],
     uiPath: '/ui',
     eventPath: '/onebot/event',
@@ -243,6 +255,7 @@ export function normalizeAppSettings(persisted?: Partial<AppSettings>): AppSetti
     dataDir: toTrimmedString(persisted.dataDir) ?? defaults.dataDir,
     host: toTrimmedString(persisted.host) ?? defaults.host,
     port: toPositiveInteger(persisted.port) ?? defaults.port,
+    trustProxy: toBoolean(persisted.trustProxy) ?? defaults.trustProxy ?? false,
     pluginSearchDirs: normalizePluginDirs(persisted.pluginSearchDirs, defaults.pluginSearchDirs),
     uiPath: normalizeRoutePath(persisted.uiPath, defaults.uiPath),
     eventPath: normalizeRoutePath(persisted.eventPath, defaults.eventPath),
@@ -293,6 +306,10 @@ export function normalizeRuntimeState(persisted?: Partial<RuntimeState>): Runtim
   if (actionTimeoutMs) {
     webSocket.actionTimeoutMs = actionTimeoutMs;
   }
+  const heartbeatIntervalMs = toNonNegativeInteger(persistedWebSocket?.heartbeatIntervalMs);
+  if (heartbeatIntervalMs !== undefined) {
+    webSocket.heartbeatIntervalMs = heartbeatIntervalMs;
+  }
   onebot.webSocket = webSocket;
   const accessToken = toTrimmedString(persistedOneBot?.accessToken);
   if (accessToken) {
@@ -318,6 +335,10 @@ export function normalizeRuntimeState(persisted?: Partial<RuntimeState>): Runtim
   const authToken = toTrimmedString(persistedUi?.authToken);
   if (authToken) {
     ui.authToken = authToken;
+  }
+  const passwordHash = toTrimmedString(persistedUi?.passwordHash);
+  if (passwordHash) {
+    ui.passwordHash = passwordHash;
   }
   const password = toTrimmedString(persistedUi?.password);
   if (password) {

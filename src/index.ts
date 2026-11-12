@@ -1,16 +1,66 @@
+import * as path from 'node:path';
+
 import { BotApplication } from './app';
 import { DEFAULT_CONFIG_PATH, loadAppConfigFile } from './config-store';
 import { createLogger } from './logger';
+import type { AppSettings } from './types';
+
+function readEnv(name: string): string | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function parseBooleanEnv(name: string, raw: string): boolean {
+  const value = raw.toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true;
+  if (['0', 'false', 'no', 'off'].includes(value)) return false;
+  throw new Error(`invalid ${name}: expected true/false, got "${raw}"`);
+}
+
+function resolveConfigPath(): string {
+  const override = readEnv('BUSYCHAT_CONFIG');
+  return override ? path.resolve(override) : DEFAULT_CONFIG_PATH;
+}
+
+/** 环境变量覆盖配置文件中的进程级设置（优先级：env > config.json > 默认值）。 */
+function applyEnvOverrides(settings: AppSettings): void {
+  const dataDir = readEnv('BUSYCHAT_DATA_DIR');
+  if (dataDir) settings.dataDir = path.resolve(dataDir);
+
+  const host = readEnv('BUSYCHAT_HOST');
+  if (host) settings.host = host;
+
+  const port = readEnv('BUSYCHAT_PORT');
+  if (port) {
+    const parsed = Number(port);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+      throw new Error(`invalid BUSYCHAT_PORT: "${port}"`);
+    }
+    settings.port = parsed;
+  }
+
+  const trustProxy = readEnv('BUSYCHAT_TRUST_PROXY');
+  if (trustProxy) {
+    settings.trustProxy = parseBooleanEnv('BUSYCHAT_TRUST_PROXY', trustProxy);
+  }
+
+  // 保证下游看到的始终是绝对路径。
+  settings.dataDir = path.resolve(settings.dataDir);
+}
 
 async function main(): Promise<void> {
   const logger = createLogger('bootstrap');
-  const config = await loadAppConfigFile(DEFAULT_CONFIG_PATH);
+  const configPath = resolveConfigPath();
+  const config = await loadAppConfigFile(configPath);
+  applyEnvOverrides(config.settings);
   logger.info('config loaded', {
-    filePath: DEFAULT_CONFIG_PATH,
+    filePath: configPath,
     dataDir: config.settings.dataDir,
   });
 
-  const app = new BotApplication(config.settings, DEFAULT_CONFIG_PATH);
+  const app = new BotApplication(config.settings, configPath);
 
   // Memoize the promise (not a boolean): a second signal or an exception
   // during shutdown must WAIT for the in-flight stop, not return immediately
@@ -66,9 +116,10 @@ async function main(): Promise<void> {
 }
 
 void main().catch((error) => {
+  const detail = error instanceof Error ? error.stack ?? error.message : String(error);
+  // 直接写 stderr：LOG_LEVEL=silent 不能把致命启动错误也吞掉。
+  process.stderr.write(`[fatal] application failed to start: ${detail}\n`);
   const logger = createLogger('bootstrap');
-  logger.error('application failed to start', {
-    error: error instanceof Error ? error.stack ?? error.message : String(error),
-  });
+  logger.error('application failed to start', { error: detail });
   process.exitCode = 1;
 });

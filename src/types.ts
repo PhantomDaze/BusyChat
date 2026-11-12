@@ -217,6 +217,12 @@ export interface TextModelRequest {
 export interface TextModelResponse {
   text: string;
   raw?: unknown;
+  /** 上游降级到回退模型时置为 true */
+  degraded?: boolean;
+  /** 实际响应本次请求的模型 id */
+  modelId?: string;
+  /** 实际响应本次请求的 provider */
+  provider?: string;
   usage?: {
     promptTokens?: number;
     completionTokens?: number;
@@ -293,6 +299,11 @@ export interface ModelGateway {
 export interface ModelAdminGateway extends ModelGateway {
   listFamilies(): ModelFamily[];
   listTasks(): ModelTask[];
+  /**
+   * 已注册的 provider 名称。WebUI 用它校验模型配置里的 provider 是否可用。
+   * 旧实现可能未提供，因此是可选的（缺失时 WebUI 退回到内置 schema 列表）。
+   */
+  listProviders?(): string[];
   listModels(): Promise<ModelCatalogEntry[]>;
   listModelsByFamily(family: ModelFamily): Promise<ModelCatalogEntry[]>;
   upsertModel(model: ModelConfig): Promise<void>;
@@ -338,6 +349,8 @@ export interface AppSettings {
   dataDir: string;
   host: string;
   port: number;
+  /** 是否信任反向代理的 X-Forwarded-* 头（默认 false）。 */
+  trustProxy?: boolean;
   pluginSearchDirs: string[];
   uiPath: string;
   eventPath: string;
@@ -365,6 +378,8 @@ export interface OneBotWebSocketConfig {
   reversePath: string;
   reconnectIntervalMs: number;
   actionTimeoutMs: number;
+  /** 心跳间隔（毫秒，默认 30000；0 表示关闭心跳）。 */
+  heartbeatIntervalMs?: number;
 }
 
 export interface SummarySettings {
@@ -380,7 +395,10 @@ export interface UiSettings {
   enabled: boolean;
   title: string;
   authToken?: string;
+  /** 旧版明文密码；启动时会迁移为 passwordHash。 */
   password?: string;
+  /** scrypt$N$r$p$salt$key 格式的密码摘要（优先于明文 password）。 */
+  passwordHash?: string;
 }
 
 /**
@@ -508,7 +526,7 @@ export interface KnowledgeControl {
 }
 
 export interface WebUiRouteHandler {
-  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path: string;
   handler: (payload: JsonObject | undefined, query: Record<string, unknown>) => MaybePromise<JsonObject>;
   label?: string;
@@ -580,6 +598,15 @@ export interface AdviceGenerationContext {
   recentSummaries: SummaryRecord[];
 }
 
+/** 存储健康状态快照（FileStore.getHealth 的结构化返回）。 */
+export interface StorageHealthSnapshot {
+  ok: boolean;
+  lastSaveAt?: string;
+  lastSaveError?: string;
+  sizeBytes: number;
+  locked: boolean;
+}
+
 export interface AppServices {
   runtime: RuntimeStore;
   bot: BotGateway;
@@ -599,6 +626,8 @@ export interface AppServices {
     countKnowledgeEntries(): Promise<number>;
     deleteKnowledgeEntry(id: string): Promise<string | false>;
     namespace(name: string): NamespacedStorage;
+    /** 运行期健康状态（供 /health/ready 使用；旧实现可能未提供）。 */
+    getHealth?(): StorageHealthSnapshot;
   };
   commands: {
     register(definition: CommandDefinition): void;
@@ -612,7 +641,18 @@ export interface AppServices {
     dispatchSummary(summary: SummaryRecord): Promise<void>;
     dispatchAdvice(advice: AdviceRecord): Promise<void>;
     shutdown(): Promise<void>;
-    list(): Promise<Array<{ name: string; version: string; enabled: boolean; description: string | undefined; filePath?: string }>>;
+    list(): Promise<
+      Array<{
+        name: string;
+        version: string;
+        enabled: boolean;
+        description: string | undefined;
+        permissions: PluginPermission[];
+        filePath?: string;
+        /** 最近一次加载/热重载失败的原因 */
+        error?: string;
+      }>
+    >;
     setEnabled(name: string, enabled: boolean): Promise<void>;
     reload(): Promise<void>;
     reloadOne(name: string): Promise<void>;
