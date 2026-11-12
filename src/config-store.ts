@@ -1,4 +1,5 @@
-import { readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
@@ -7,6 +8,7 @@ import {
   normalizeAppConfig,
   normalizeRuntimeState,
 } from './config';
+import { atomicWriteFile, hardenFile, isMissingFileError } from './fs-utils';
 import type { AppConfigFile, AppConfigStore, AppSettings, RuntimeState } from './types';
 
 export const DEFAULT_CONFIG_PATH = path.resolve(process.cwd(), 'config.json');
@@ -15,10 +17,6 @@ const DEFAULT_LEGACY_RUNTIME_PATH = path.resolve(
   createDefaultAppSettings().dataDir,
   'runtime.json',
 );
-
-function isMissingFileError(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'ENOENT';
-}
 
 async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
   try {
@@ -33,11 +31,9 @@ async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
 }
 
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
-  // Write to a temp file then atomically rename over the target, so a crash
-  // mid-write can never leave a truncated (and thus unparseable) config.json.
-  const tmpPath = `${filePath}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await rename(tmpPath, filePath);
+  // 原子且持久的写入（临时文件 + fsync + rename + 目录 fsync），
+  // 崩溃时不会留下被截断、无法解析的 config.json。
+  await atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
 }
 
 function clone<T>(value: T): T {
@@ -46,6 +42,11 @@ function clone<T>(value: T): T {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** 配置内容指纹：用于 WebUI 判断配置是否发生变化。 */
+function computeRevision(config: AppConfigFile): string {
+  return createHash('sha256').update(JSON.stringify(config)).digest('hex');
 }
 
 async function loadLegacyRuntimeState(filePath: string): Promise<RuntimeState | undefined> {
@@ -86,8 +87,15 @@ export async function saveAppConfigFile(filePath: string, config: AppConfigFile)
 
 export class JsonConfigStore implements AppConfigStore {
   private lock: Promise<void> = Promise.resolve();
+  /** 最近一次成功加载/保存的配置（last-known-good）。 */
   private cache: AppConfigFile | null = null;
   private cacheMtimeMs = -1;
+  /** 最近一次加载失败时文件的 mtime；只有 mtime 再次变化才重试。 */
+  private failedMtimeMs: number | null = null;
+  private lastError: string | undefined;
+  /** 已记录过日志的失败 mtime，避免每次访问都刷错误日志。 */
+  private loggedFailureMtimeMs: number | null = null;
+  private revision = '';
 
   constructor(private readonly filePath: string = DEFAULT_CONFIG_PATH) {}
 
@@ -105,29 +113,78 @@ export class JsonConfigStore implements AppConfigStore {
     }
   }
 
+  private async acceptLoaded(config: AppConfigFile): Promise<void> {
+    this.cache = config;
+    this.cacheMtimeMs = await this.fileMtimeMs();
+    this.failedMtimeMs = null;
+    this.loggedFailureMtimeMs = null;
+    this.lastError = undefined;
+    this.revision = computeRevision(config);
+  }
+
   /**
-   * Cached read, invalidated by the file's mtime: a cheap stat per access
-   * (instead of a full read+parse) while still honoring config.json edits made
-   * on disk while the app runs — the documented workflow for headless setups.
+   * 缓存读取，按文件 mtime 失效：每次访问只需一次 stat，同时仍支持运行期间
+   * 手工编辑 config.json。文件损坏时退回 last-known-good，而不是让所有访问
+   * 永久抛错；同一次损坏（mtime 未变）只记录一次日志，mtime 变化后才重试。
    */
   private async loadCached(): Promise<AppConfigFile> {
     const mtime = await this.fileMtimeMs();
-    if (!this.cache || mtime !== this.cacheMtimeMs) {
-      this.cache = await loadAppConfigFile(this.filePath);
-      this.cacheMtimeMs = await this.fileMtimeMs();
+
+    // 上次已确认这个 mtime 的文件坏掉：文件没再变化就不要反复解析。
+    if (this.failedMtimeMs !== null && mtime === this.failedMtimeMs) {
+      if (this.cache) return this.cache;
+      throw new Error(this.lastError ?? `invalid config file: ${this.filePath}`);
     }
-    return this.cache;
+
+    if (this.cache && mtime === this.cacheMtimeMs) {
+      return this.cache;
+    }
+
+    try {
+      const loaded = await loadAppConfigFile(this.filePath);
+      await this.acceptLoaded(loaded);
+      return loaded;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastError = message;
+      this.failedMtimeMs = mtime;
+      if (this.loggedFailureMtimeMs !== mtime) {
+        this.loggedFailureMtimeMs = mtime;
+        console.error(
+          `[config] failed to load ${this.filePath}: ${message}` +
+            (this.cache ? ' — keeping last-known-good config in memory' : ''),
+        );
+      }
+      // 没有任何可用旧配置时保持原有行为：向上抛出。
+      if (!this.cache) throw error;
+      return this.cache;
+    }
   }
 
   private async persist(config: AppConfigFile): Promise<void> {
     await saveAppConfigFile(this.filePath, config);
-    this.cache = config;
-    this.cacheMtimeMs = await this.fileMtimeMs();
+    await this.acceptLoaded(config);
   }
 
   async ensureReady(): Promise<void> {
-    this.cache = await loadAppConfigFile(this.filePath);
-    this.cacheMtimeMs = await this.fileMtimeMs();
+    // config.json 可能位于 dataDir 之外，因此在这里单独收紧权限。
+    await hardenFile(this.filePath, 0o600);
+    try {
+      await this.loadCached();
+    } finally {
+      // 首次启动会新建 config.json；无论成功与否都确保权限不宽于 0600。
+      await hardenFile(this.filePath, 0o600);
+    }
+  }
+
+  /** 最近一次加载失败的错误信息（成功加载后清空）。 */
+  getLastError(): string | undefined {
+    return this.lastError;
+  }
+
+  /** 当前生效配置的内容指纹（sha256，十六进制）。 */
+  getRevision(): string {
+    return this.revision;
   }
 
   /**
